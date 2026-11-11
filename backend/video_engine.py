@@ -2445,6 +2445,186 @@ def detect_video_saliency_and_motion_center(sampled_small_frames: List[Any]) -> 
     return 0.50, 0.35
 
 
+def analyze_lip_motion_for_faces(
+    frames: List[Any],
+    face_detections_per_frame: List[List[Dict[str, Any]]],
+    frame_width: int,
+    frame_height: int
+) -> Dict[str, float]:
+    """
+    Analyzes lip/mouth region motion for each detected face cluster to identify the active speaker.
+    Returns a dictionary mapping face cluster ID (based on position) to lip motion score.
+    Higher score = more likely to be the speaker.
+    """
+    import cv2
+    import numpy as np
+    
+    if len(frames) < 2 or not face_detections_per_frame:
+        return {}
+    
+    # Group faces into spatial clusters (same person across frames)
+    face_clusters: Dict[str, List[Tuple[int, Dict[str, Any]]]] = {}
+    
+    for frame_idx, faces in enumerate(face_detections_per_frame):
+        for face in faces:
+            # Create cluster key based on approximate position (rounded to 0.1)
+            cluster_key = f"{round(face['cx'], 1)}_{round(face['cy'], 1)}"
+            
+            # Find existing cluster within distance threshold
+            matched_key = None
+            for existing_key in face_clusters.keys():
+                ex_cx, ex_cy = map(float, existing_key.split('_'))
+                dist = ((ex_cx - face['cx'])**2 + (ex_cy - face['cy'])**2)**0.5
+                if dist < 0.15:
+                    matched_key = existing_key
+                    break
+            
+            if matched_key:
+                face_clusters[matched_key].append((frame_idx, face))
+            else:
+                face_clusters[cluster_key] = [(frame_idx, face)]
+    
+    # Calculate lip motion score for each cluster
+    lip_motion_scores: Dict[str, float] = {}
+    
+    for cluster_key, face_frames in face_clusters.items():
+        if len(face_frames) < 2:
+            lip_motion_scores[cluster_key] = 0.0
+            continue
+        
+        total_motion = 0.0
+        motion_samples = 0
+        
+        for i in range(1, len(face_frames)):
+            prev_frame_idx, prev_face = face_frames[i - 1]
+            curr_frame_idx, curr_face = face_frames[i]
+            
+            if curr_frame_idx - prev_frame_idx > 3:  # Skip if frames too far apart
+                continue
+            
+            if prev_frame_idx >= len(frames) or curr_frame_idx >= len(frames):
+                continue
+            
+            prev_frame = frames[prev_frame_idx]
+            curr_frame = frames[curr_frame_idx]
+            
+            if prev_frame is None or curr_frame is None:
+                continue
+            
+            try:
+                # Extract mouth region (lower 40% of face bounding box)
+                # Face coords are normalized (0-1), convert to pixels
+                face_x = int(curr_face['cx'] * frame_width - (curr_face['w'] * frame_width / 2))
+                face_y = int(curr_face['cy'] * frame_height - (curr_face['h'] * frame_height / 2))
+                face_w = int(curr_face['w'] * frame_width)
+                face_h = int(curr_face['h'] * frame_height)
+                
+                # Mouth region: lower 40% of face, centered horizontally
+                mouth_x = max(0, face_x + int(face_w * 0.2))
+                mouth_y = max(0, face_y + int(face_h * 0.55))
+                mouth_w = int(face_w * 0.6)
+                mouth_h = int(face_h * 0.35)
+                
+                mouth_x2 = min(frame_width, mouth_x + mouth_w)
+                mouth_y2 = min(frame_height, mouth_y + mouth_h)
+                
+                if mouth_w < 10 or mouth_h < 5:
+                    continue
+                
+                # Extract mouth regions from both frames
+                prev_mouth = prev_frame[mouth_y:mouth_y2, mouth_x:mouth_x2]
+                curr_mouth = curr_frame[mouth_y:mouth_y2, mouth_x:mouth_x2]
+                
+                if prev_mouth.size == 0 or curr_mouth.size == 0:
+                    continue
+                
+                # Resize to same size for comparison
+                target_size = (60, 30)
+                prev_mouth_resized = cv2.resize(prev_mouth, target_size)
+                curr_mouth_resized = cv2.resize(curr_mouth, target_size)
+                
+                # Convert to grayscale
+                prev_gray = cv2.cvtColor(prev_mouth_resized, cv2.COLOR_BGR2GRAY)
+                curr_gray = cv2.cvtColor(curr_mouth_resized, cv2.COLOR_BGR2GRAY)
+                
+                # Calculate absolute difference (motion)
+                diff = cv2.absdiff(prev_gray, curr_gray)
+                motion_value = float(np.mean(diff))
+                
+                total_motion += motion_value
+                motion_samples += 1
+                
+            except Exception:
+                continue
+        
+        if motion_samples > 0:
+            lip_motion_scores[cluster_key] = total_motion / motion_samples
+        else:
+            lip_motion_scores[cluster_key] = 0.0
+    
+    return lip_motion_scores
+
+
+def extract_audio_energy_timeline(video_path: str, num_samples: int = 20) -> List[float]:
+    """
+    Extracts audio energy/RMS values across the video timeline.
+    Returns a list of energy values (0.0 to 1.0) for each time segment.
+    """
+    import subprocess
+    import numpy as np
+    
+    try:
+        temp_wav = TEMP_DIR / f"speaker_detect_{int(time.time())}.wav"
+        
+        # Extract audio to WAV
+        cmd = [
+            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+            "-i", str(video_path),
+            "-vn", "-ac", "1", "-ar", "8000",
+            "-t", "30",  # Max 30 seconds for analysis
+            "-f", "wav",
+            str(temp_wav)
+        ]
+        res = subprocess.run(cmd, capture_output=True, timeout=15)
+        
+        if res.returncode != 0 or not temp_wav.exists():
+            return [0.5] * num_samples
+        
+        import wave
+        with wave.open(str(temp_wav), "rb") as wf:
+            n_frames = wf.getnframes()
+            audio_bytes = wf.readframes(n_frames)
+            audio_data = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32)
+        
+        temp_wav.unlink()
+        
+        if len(audio_data) == 0:
+            return [0.5] * num_samples
+        
+        # Split into segments and calculate RMS energy
+        samples_per_seg = len(audio_data) // num_samples
+        energy_values = []
+        
+        for i in range(num_samples):
+            chunk = audio_data[i * samples_per_seg : (i + 1) * samples_per_seg]
+            if len(chunk) > 0:
+                rms = float(np.sqrt(np.mean(chunk**2)))
+                energy_values.append(rms)
+            else:
+                energy_values.append(0.0)
+        
+        # Normalize to 0-1
+        max_energy = max(energy_values) if energy_values else 1.0
+        if max_energy > 0:
+            energy_values = [e / max_energy for e in energy_values]
+        
+        return energy_values
+        
+    except Exception as e:
+        logger.warning(f"Audio energy extraction failed: {e}")
+        return [0.5] * num_samples
+
+
 def detect_speaker_face_box(
     source_path: str,
     facecam_position: str = "auto",
@@ -2453,6 +2633,10 @@ def detect_speaker_face_box(
     """
     Detects speaker face or non-facecam salient action/object bounding box.
     Uses OpenCV YuNet Deep Neural Network + Saliency/Motion Object detection.
+    
+    NEW: When multiple faces are detected, uses Active Speaker Detection (ASD)
+    to identify who is speaking by analyzing lip/mouth motion correlated with audio.
+    
     Prevents false alarms on walls, backgrounds, and empty textures.
     Returns normalized coordinates:
     {
@@ -2651,22 +2835,30 @@ def detect_speaker_face_box(
 
         fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-        # Low-CPU keyframe sampling: 10 frames are sufficient for spatial clustering without loading server CPU
-        step = max(1, total_frames // 10) if total_frames > 10 else max(1, int(fps * 1.5))
+        frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 1920)
+        frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 1080)
+        
+        # Increased sampling for better Active Speaker Detection: 15 frames
+        step = max(1, total_frames // 15) if total_frames > 15 else max(1, int(fps * 1.0))
 
         detections = []
         sampled_small_frames = []
+        sampled_full_frames = []  # Keep full-res frames for lip motion analysis
+        face_detections_per_frame = []  # Track faces per frame for ASD
         frame_idx = 0
         checked = 0
-        while cap.isOpened() and frame_idx < total_frames and checked < 10:
+        while cap.isOpened() and frame_idx < total_frames and checked < 15:
             cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
             ret, frame = cap.read()
             frame_idx += step
             checked += 1
             if not ret or frame is None:
+                face_detections_per_frame.append([])
                 continue
             sampled_small_frames.append(cv2.resize(frame, (320, 180)))
+            sampled_full_frames.append(frame.copy())  # Store full-res frame
             f_faces = detect_frame_faces(frame)
+            face_detections_per_frame.append(f_faces)
             if f_faces:
                 detections.extend(f_faces)
 
@@ -2745,21 +2937,97 @@ def detect_speaker_face_box(
                     }
                 return {"found": True, "is_corner_cam": True, "cx": 0.50, "cy": 0.35, "w": 0.22, "h": 0.25}
 
-            # Check for dual speakers on opposite sides (interviews, podcasts, co-hosts)
-            left_speakers = [c for c in foreground_clusters if c["cx"] < 0.40 and len(c["pts"]) >= 3]
-            right_speakers = [c for c in foreground_clusters if c["cx"] > 0.60 and len(c["pts"]) >= 3]
-            if left_speakers and right_speakers:
-                mid_cx = (max(left_speakers, key=lambda c: len(c["pts"]))["cx"] + max(right_speakers, key=lambda c: len(c["pts"]))["cx"]) / 2.0
-                return {"found": True, "cx": float(round(mid_cx, 3)), "cy": 0.35, "w": 0.25, "h": 0.25, "dual_speakers": True}
+            # ============================================================
+            # ACTIVE SPEAKER DETECTION (ASD) for multiple faces
+            # When 2+ faces are detected, analyze lip motion to find speaker
+            # ============================================================
+            if len(foreground_clusters) >= 2 and sampled_full_frames:
+                logger.info(f"Multiple faces detected ({len(foreground_clusters)}), running Active Speaker Detection...")
+                
+                try:
+                    # Analyze lip motion for each face cluster
+                    lip_motion_scores = analyze_lip_motion_for_faces(
+                        sampled_full_frames,
+                        face_detections_per_frame,
+                        frame_width,
+                        frame_height
+                    )
+                    
+                    # Get audio energy to weight lip motion scores
+                    audio_energy = extract_audio_energy_timeline(source_path, num_samples=len(sampled_full_frames))
+                    avg_audio_energy = sum(audio_energy) / len(audio_energy) if audio_energy else 0.5
+                    
+                    if lip_motion_scores and avg_audio_energy > 0.1:  # Only use ASD if there's actual speech
+                        # Find cluster with highest lip motion
+                        best_speaker_key = None
+                        best_motion_score = 0.0
+                        
+                        for cluster in foreground_clusters:
+                            cluster_key = f"{round(cluster['cx'], 1)}_{round(cluster['cy'], 1)}"
+                            
+                            # Find matching lip motion score (allow some tolerance)
+                            matched_score = 0.0
+                            for lm_key, lm_score in lip_motion_scores.items():
+                                lm_cx, lm_cy = map(float, lm_key.split('_'))
+                                if abs(lm_cx - cluster['cx']) < 0.15 and abs(lm_cy - cluster['cy']) < 0.15:
+                                    matched_score = max(matched_score, lm_score)
+                            
+                            # Combine lip motion with existing scoring factors
+                            avg_w = sum(p["w"] for p in cluster["pts"]) / len(cluster["pts"])
+                            avg_conf = sum(p["conf"] for p in cluster["pts"]) / len(cluster["pts"])
+                            
+                            # Weighted score: lip motion (60%) + size (20%) + confidence (20%)
+                            combined_score = (matched_score * 0.6) + (avg_w * 100 * 0.2) + (avg_conf * 0.2)
+                            
+                            if combined_score > best_motion_score:
+                                best_motion_score = combined_score
+                                best_speaker_key = cluster
+                        
+                        if best_speaker_key and best_motion_score > 0:
+                            chosen = best_speaker_key
+                            logger.info(f"Active Speaker Detection selected speaker at ({chosen['cx']:.3f}, {chosen['cy']:.3f}) with motion score {best_motion_score:.3f}")
+                        else:
+                            # Fallback to standard scoring if ASD fails
+                            def score_cluster(c):
+                                avg_w = sum(p["w"] for p in c["pts"]) / len(c["pts"])
+                                avg_conf = sum(p["conf"] for p in c["pts"]) / len(c["pts"])
+                                center_prior = 1.0 - 0.35 * abs(c["cx"] - 0.5)
+                                return len(c["pts"]) * (avg_w ** 0.5) * avg_conf * center_prior
+                            chosen = max(foreground_clusters, key=score_cluster)
+                    else:
+                        # Low audio energy or no lip motion data, use standard scoring
+                        def score_cluster(c):
+                            avg_w = sum(p["w"] for p in c["pts"]) / len(c["pts"])
+                            avg_conf = sum(p["conf"] for p in c["pts"]) / len(c["pts"])
+                            center_prior = 1.0 - 0.35 * abs(c["cx"] - 0.5)
+                            return len(c["pts"]) * (avg_w ** 0.5) * avg_conf * center_prior
+                        chosen = max(foreground_clusters, key=score_cluster)
+                        
+                except Exception as asd_err:
+                    logger.warning(f"Active Speaker Detection failed ({asd_err}), using standard face selection")
+                    def score_cluster(c):
+                        avg_w = sum(p["w"] for p in c["pts"]) / len(c["pts"])
+                        avg_conf = sum(p["conf"] for p in c["pts"]) / len(c["pts"])
+                        center_prior = 1.0 - 0.35 * abs(c["cx"] - 0.5)
+                        return len(c["pts"]) * (avg_w ** 0.5) * avg_conf * center_prior
+                    chosen = max(foreground_clusters, key=score_cluster)
+            else:
+                # Single face or no full frames - use standard scoring
+                # Check for dual speakers on opposite sides (interviews, podcasts, co-hosts)
+                left_speakers = [c for c in foreground_clusters if c["cx"] < 0.40 and len(c["pts"]) >= 3]
+                right_speakers = [c for c in foreground_clusters if c["cx"] > 0.60 and len(c["pts"]) >= 3]
+                if left_speakers and right_speakers:
+                    mid_cx = (max(left_speakers, key=lambda c: len(c["pts"]))["cx"] + max(right_speakers, key=lambda c: len(c["pts"]))["cx"]) / 2.0
+                    return {"found": True, "cx": float(round(mid_cx, 3)), "cy": 0.35, "w": 0.25, "h": 0.25, "dual_speakers": True}
 
-            # Rank foreground candidates by: consistency * size * confidence * center prior
-            def score_cluster(c):
-                avg_w = sum(p["w"] for p in c["pts"]) / len(c["pts"])
-                avg_conf = sum(p["conf"] for p in c["pts"]) / len(c["pts"])
-                center_prior = 1.0 - 0.35 * abs(c["cx"] - 0.5)
-                return len(c["pts"]) * (avg_w ** 0.5) * avg_conf * center_prior
+                # Rank foreground candidates by: consistency * size * confidence * center prior
+                def score_cluster(c):
+                    avg_w = sum(p["w"] for p in c["pts"]) / len(c["pts"])
+                    avg_conf = sum(p["conf"] for p in c["pts"]) / len(c["pts"])
+                    center_prior = 1.0 - 0.35 * abs(c["cx"] - 0.5)
+                    return len(c["pts"]) * (avg_w ** 0.5) * avg_conf * center_prior
 
-            chosen = max(foreground_clusters, key=score_cluster)
+                chosen = max(foreground_clusters, key=score_cluster)
 
         avg_w = sum(p["w"] for p in chosen["pts"]) / len(chosen["pts"])
         avg_h = sum(p["h"] for p in chosen["pts"]) / len(chosen["pts"])
