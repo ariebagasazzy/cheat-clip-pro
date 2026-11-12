@@ -3,6 +3,7 @@ import { RefreshCw, AlertTriangle } from 'lucide-react';
 import { useLanguage } from '../locales';
 import type { BatchRenderProgress } from '../types';
 import styles from './BatchRenderProgressModal.module.css';
+import { ShareButton } from './ShareButton';
 
 interface BatchRenderProgressModalProps {
   isOpen: boolean;
@@ -84,14 +85,23 @@ export const BatchRenderProgressModal: React.FC<BatchRenderProgressModalProps> =
                   <div className={styles.completedActionRow}>
                     <span className={`${styles.statusBadge} ${styles.badgeSuccess}`}>{t.batchProgress.statusDone}</span>
                     {clip.download_url && (
-                      <a
-                        href={clip.download_url}
-                        download
-                        className={styles.btnDownloadClip}
-                        title={t.batchProgress.downloadMp4Tooltip}
-                      >
-                        [v] MP4
-                      </a>
+                      <>
+                        <a
+                          href={clip.download_url}
+                          download
+                          className={styles.btnDownloadClip}
+                          title={t.batchProgress.downloadMp4Tooltip}
+                        >
+                          [v] MP4
+                        </a>
+                        <ShareButton
+                          videoUrl={clip.download_url}
+                          videoTitle={clip.title || `Clip #${idx + 1}`}
+                          fileName={`clip_${idx + 1}.mp4`}
+                          variant="icon"
+                          size="sm"
+                        />
+                      </>
                     )}
                   </div>
                 )}
@@ -151,13 +161,22 @@ export const BatchRenderProgressModal: React.FC<BatchRenderProgressModalProps> =
                 </button>
               )}
               {progress.zip_url && (
-                <a
-                  href={progress.zip_url}
-                  download
-                  className={styles.zipDownloadBtn}
-                >
-                  {t.batchProgress.downloadZip}
-                </a>
+                <>
+                  <a
+                    href={progress.zip_url}
+                    download
+                    className={styles.zipDownloadBtn}
+                  >
+                    {t.batchProgress.downloadZip}
+                  </a>
+                  <ShareButton
+                    videoUrl={progress.zip_url}
+                    videoTitle="Cheat Clip Pro - All Clips"
+                    fileName={`cheat_clips_${progress.batch_id || 'batch'}.zip`}
+                    variant="button"
+                    size="md"
+                  />
+                </>
               )}
               <button className={styles.closeStudioBtn} onClick={onClose}>
                 {t.batchProgress.closeStudio}

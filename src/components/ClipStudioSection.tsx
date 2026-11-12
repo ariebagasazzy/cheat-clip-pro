@@ -20,6 +20,7 @@ import { getStoredCookies, hasStoredCookies } from '../utils/cookieUtils';
 import { detectFaceClientSide } from '../utils/clientFaceDetector';
 import { isMobileDevice } from '../utils/deviceUtils';
 import { isWebCodecsGpuSupported, getClientGpuName } from '../services/webcodecsRenderer';
+import { ShareButton } from './ShareButton';
 import type {
   ViralClip,
   RenderSettings,
@@ -5518,28 +5519,37 @@ export const ClipStudioSection: React.FC<ClipStudioSectionProps> = ({
               )}
 
               {(batchProgress.overall_status === 'completed' || batchProgress.clips.some(c => c.status === 'completed')) && (
-                <a
-                  href={batchProgress.zip_url || `/api/download-batch-zip/${batchProgress.batch_id}`}
-                  download={`cheat_clip_pro_${batchProgress.batch_id}.zip`}
-                  className="glowing-btn batch-zip-download-btn"
-                  style={{
-                    display: 'flex',
-                    alignItems: 'center',
-                    gap: '0.35rem',
-                    background: 'linear-gradient(135deg, #10b981 0%, #059669 100%)',
-                    border: '1px solid rgba(16, 185, 129, 0.6)',
-                    color: '#ffffff',
-                    fontWeight: 700,
-                    fontSize: '0.72rem',
-                    padding: '0.3rem 0.65rem',
-                    borderRadius: '6px',
-                    textDecoration: 'none',
-                    boxShadow: '0 0 12px rgba(16, 185, 129, 0.35)',
-                    cursor: 'pointer',
-                  }}
-                >
-                  [PKG] ZIP
-                </a>
+                <>
+                  <a
+                    href={batchProgress.zip_url || `/api/download-batch-zip/${batchProgress.batch_id}`}
+                    download={`cheat_clip_pro_${batchProgress.batch_id}.zip`}
+                    className="glowing-btn batch-zip-download-btn"
+                    style={{
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: '0.35rem',
+                      background: 'linear-gradient(135deg, #10b981 0%, #059669 100%)',
+                      border: '1px solid rgba(16, 185, 129, 0.6)',
+                      color: '#ffffff',
+                      fontWeight: 700,
+                      fontSize: '0.72rem',
+                      padding: '0.3rem 0.65rem',
+                      borderRadius: '6px',
+                      textDecoration: 'none',
+                      boxShadow: '0 0 12px rgba(16, 185, 129, 0.35)',
+                      cursor: 'pointer',
+                    }}
+                  >
+                    [PKG] ZIP
+                  </a>
+                  <ShareButton
+                    videoUrl={batchProgress.zip_url || `/api/download-batch-zip/${batchProgress.batch_id}`}
+                    videoTitle="Cheat Clip Pro Batch"
+                    fileName={`cheat_clip_pro_${batchProgress.batch_id}.zip`}
+                    variant="icon"
+                    size="sm"
+                  />
+                </>
               )}
 
               {(batchProgress.overall_status === 'completed' || batchProgress.overall_status === 'error') && onDismissProgress && (
