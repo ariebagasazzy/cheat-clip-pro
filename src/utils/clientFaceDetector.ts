@@ -24,7 +24,6 @@ export interface DetectedFaceBox {
 
 // Store previous frame data for motion detection
 let previousFrameData: ImageData | null = null;
-let previousFaces: Array<{ cx: number; cy: number; w: number; h: number; area: number }> = [];
 
 /**
  * Analyzes mouth region motion between frames to detect speaking
@@ -284,5 +283,4 @@ export async function detectFaceClientSide(
  */
 export function resetFaceDetectionBuffer(): void {
   previousFrameData = null;
-  previousFaces = [];
 }
