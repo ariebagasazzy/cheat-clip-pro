@@ -2376,6 +2376,8 @@ def detect_video_saliency_and_motion_center(sampled_small_frames: List[Any]) -> 
     Computes combined visual saliency + inter-frame motion center for non-facecam videos
     (gameplay, tutorials, product unboxing, sports, animations, nature, etc.).
     Guarantees the camera tracks actual action/objects and never stares at an empty wall.
+    
+    IMPROVED: Prioritizes skin-tone regions to avoid focusing on text/graphics instead of people.
     """
     if not sampled_small_frames:
         return 0.50, 0.35
@@ -2383,6 +2385,43 @@ def detect_video_saliency_and_motion_center(sampled_small_frames: List[Any]) -> 
     try:
         import cv2
         import numpy as np
+        
+        # First, try to find skin-tone regions (likely human presence)
+        skin_centers = []
+        for small in sampled_small_frames[:5]:  # Check first 5 frames
+            try:
+                ycrcb = cv2.cvtColor(small, cv2.COLOR_BGR2YCrCb)
+                lower_skin = np.array([0, 133, 77], dtype=np.uint8)
+                upper_skin = np.array([255, 173, 127], dtype=np.uint8)
+                skin_mask = cv2.inRange(ycrcb, lower_skin, upper_skin)
+                
+                # Only consider upper 70% of frame (faces are usually there)
+                h, w = skin_mask.shape
+                skin_mask[int(h * 0.7):, :] = 0
+                
+                # Calculate skin centroid
+                moments = cv2.moments(skin_mask)
+                if moments["m00"] > (w * h * 0.01):  # At least 1% skin coverage
+                    scx = (moments["m10"] / moments["m00"]) / w
+                    scy = (moments["m01"] / moments["m00"]) / h
+                    coverage = moments["m00"] / (w * h)
+                    skin_centers.append((scx, scy, coverage))
+            except Exception:
+                pass
+        
+        # If significant skin detected, prioritize it over saliency
+        if skin_centers and len(skin_centers) >= 2:
+            avg_skin_cx = sum(s[0] for s in skin_centers) / len(skin_centers)
+            avg_skin_cy = sum(s[1] for s in skin_centers) / len(skin_centers)
+            total_coverage = sum(s[2] for s in skin_centers) / len(skin_centers)
+            
+            if total_coverage > 0.02:  # More than 2% skin coverage = likely a person
+                logger.info(f"Skin-tone priority: detected human at ({avg_skin_cx:.3f}, {avg_skin_cy:.3f}) with {total_coverage*100:.1f}% coverage")
+                # Snap to center if close
+                if 0.40 <= avg_skin_cx <= 0.60:
+                    avg_skin_cx = 0.50
+                return max(0.26, min(0.74, avg_skin_cx)), max(0.20, min(0.60, avg_skin_cy))
+        
         saliency = cv2.saliency.StaticSaliencySpectralResidual_create()
         centers = []
 
