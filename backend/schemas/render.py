@@ -55,6 +55,11 @@ class RenderSettingsModel(BaseModel):
     # Multi-Segment Merged Highlight Video
     render_mode: Optional[str] = "separate"  # "separate" | "merged"
     compilation_title: Optional[str] = None
+    # B-Roll Auto-Insert
+    broll_enabled: Optional[bool] = False
+    broll_mode: Optional[str] = "replace"  # "replace", "pip", "split"
+    broll_duration: Optional[float] = 3.0
+    broll_max_segments: Optional[int] = 2
 
 class RenderBatchRequest(BaseModel):
     video_url: str

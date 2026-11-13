@@ -3569,7 +3569,9 @@ def render_clip_to_mp4(
     hardware_accel: Optional[str] = "auto",
     title_y_percent: Optional[float] = None,
     crop_x_percent: Optional[float] = None,
-    title_x_percent: Optional[float] = 50.0
+    title_x_percent: Optional[float] = 50.0,
+    # B-Roll Auto-Insert
+    broll_segments: Optional[List[Any]] = None
 ) -> str:
     """
     Renders the final 1080x1920 short-form video with layout, aspect ratio, titles, subtitles,
@@ -3641,6 +3643,82 @@ def render_clip_to_mp4(
         overlay_title_cmd = f"{out_video_map}[{t_idx}:v]overlay=0:0{enable_expr}[v_with_title_overlay]"
         filter_chains.append(overlay_title_cmd)
         out_video_map = "[v_with_title_overlay]"
+
+    # 1.5. Apply B-Roll Auto-Insert (before watermark and other overlays)
+    if broll_segments and len(broll_segments) > 0:
+        canvas_w = 1920 if aspect_ratio == "16:9_landscape" else 1080
+        canvas_h = 1080 if aspect_ratio == "16:9_landscape" else 1920
+        
+        for i, seg in enumerate(broll_segments):
+            # Check if segment has valid video_path
+            broll_path = getattr(seg, 'video_path', None) or (seg.get('video_path') if isinstance(seg, dict) else None)
+            if not broll_path or not os.path.exists(broll_path):
+                continue
+            
+            broll_idx = input_idx_counter
+            input_idx_counter += 1
+            extra_input_args.extend(["-i", str(broll_path)])
+            
+            # Get segment properties
+            start_t = getattr(seg, 'start_time', None) or (seg.get('start_time', 0) if isinstance(seg, dict) else 0)
+            duration = getattr(seg, 'duration', None) or (seg.get('duration', 3.0) if isinstance(seg, dict) else 3.0)
+            insert_mode = getattr(seg, 'insert_mode', None) or (seg.get('insert_mode', 'replace') if isinstance(seg, dict) else 'replace')
+            
+            end_t = start_t + duration
+            
+            # Scale B-Roll to canvas size
+            broll_scale_name = f"broll_scaled_{i}"
+            filter_chains.append(
+                f"[{broll_idx}:v]scale={canvas_w}:{canvas_h}:force_original_aspect_ratio=increase,"
+                f"crop={canvas_w}:{canvas_h},setpts=PTS-STARTPTS[{broll_scale_name}]"
+            )
+            
+            if insert_mode == "replace":
+                # Full screen B-Roll: overlay replaces main video during time window
+                overlay_broll = (
+                    f"{out_video_map}[{broll_scale_name}]overlay=0:0:"
+                    f"enable='between(t,{start_t},{end_t})'[v_broll_{i}]"
+                )
+                filter_chains.append(overlay_broll)
+                out_video_map = f"[v_broll_{i}]"
+            
+            elif insert_mode == "pip":
+                # Picture-in-Picture: B-Roll in top-right corner
+                pip_w = int(canvas_w * 0.40)
+                pip_h = int(canvas_h * 0.25)
+                pip_x = int(canvas_w * 0.57)
+                pip_y = int(canvas_h * 0.05)
+                
+                filter_chains.append(
+                    f"[{broll_scale_name}]scale={pip_w}:{pip_h}[broll_pip_{i}]"
+                )
+                overlay_broll = (
+                    f"{out_video_map}[broll_pip_{i}]overlay={pip_x}:{pip_y}:"
+                    f"enable='between(t,{start_t},{end_t})'[v_broll_{i}]"
+                )
+                filter_chains.append(overlay_broll)
+                out_video_map = f"[v_broll_{i}]"
+            
+            elif insert_mode == "split":
+                # 50/50 split screen: B-Roll on top, main on bottom
+                split_h = canvas_h // 2
+                
+                # Scale B-Roll to top half
+                filter_chains.append(
+                    f"[{broll_scale_name}]scale={canvas_w}:{split_h}[broll_top_{i}]"
+                )
+                
+                # Scale main video to bottom half (only during split window)
+                # This is complex in FFmpeg, so for MVP we'll do full-replace style split
+                # by overlaying a split composition
+                overlay_broll = (
+                    f"{out_video_map}[broll_top_{i}]overlay=0:0:"
+                    f"enable='between(t,{start_t},{end_t})'[v_broll_{i}]"
+                )
+                filter_chains.append(overlay_broll)
+                out_video_map = f"[v_broll_{i}]"
+        
+        logger.info(f"Applied {len(broll_segments)} B-Roll segments to video")
 
     # 2. Apply Watermark Overlay
     if watermark_enabled and float(watermark_size) > 0:

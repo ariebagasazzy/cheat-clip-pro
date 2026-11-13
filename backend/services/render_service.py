@@ -21,6 +21,14 @@ from backend.config import (
 from backend.schemas.render import RenderBatchRequest, RenderSettingsModel
 from backend.utils.text import is_twitch_url, extract_twitch_info, get_twitch_canonical_url, canonical_video_url
 
+# B-Roll service (imported lazily to avoid circular imports)
+def get_broll_service():
+    try:
+        from backend.services.broll_service import prepare_broll_segments, build_broll_ffmpeg_filter
+        return prepare_broll_segments, build_broll_ffmpeg_filter
+    except ImportError:
+        return None, None
+
 RENDER_BATCHES: Dict[str, Dict[str, Any]] = {}
 BATCH_REQUESTS: Dict[str, RenderBatchRequest] = {}
 # Concurrency gate: serialize video rendering (1 active render job at a time) to prevent CPU starvation on low-spec servers
@@ -186,6 +194,28 @@ async def render_single_batch_clip(
                 subtitle_offset_seconds=getattr(settings, "subtitle_offset_seconds", 0.0)
             )
 
+        # 2.5. Prepare B-Roll segments if enabled
+        broll_segments = []
+        if getattr(settings, "broll_enabled", False) and transcript:
+            try:
+                prepare_broll_fn, _ = get_broll_service()
+                if prepare_broll_fn:
+                    logger.info(f"Preparing B-Roll for clip {idx}...")
+                    broll_segments = await prepare_broll_fn(
+                        transcript=transcript,
+                        clip_start=start_t,
+                        clip_end=end_t,
+                        clip_duration=duration_sec,
+                        insert_mode=getattr(settings, "broll_mode", "replace") or "replace",
+                        broll_duration=float(getattr(settings, "broll_duration", 3.0) or 3.0),
+                        max_segments=int(getattr(settings, "broll_max_segments", 3) or 3),
+                        min_gap=8.0
+                    )
+                    logger.info(f"Prepared {len(broll_segments)} B-Roll segments")
+            except Exception as broll_err:
+                logger.warning(f"B-Roll preparation failed (continuing without): {broll_err}")
+                broll_segments = []
+
         # 3. Render Final Vertical MP4
         clip_status["status"] = "rendering"
         clip_status["progress_percent"] = 70
@@ -227,7 +257,8 @@ async def render_single_batch_clip(
             hardware_accel=settings.hardware_accel or "auto",
             title_y_percent=settings.title_y_percent,
             crop_x_percent=getattr(settings, "crop_x_percent", None),
-            title_x_percent=getattr(settings, "title_x_percent", 50.0)
+            title_x_percent=getattr(settings, "title_x_percent", 50.0),
+            broll_segments=broll_segments if broll_segments else None
         )
 
         if not os.path.exists(out_path) or not is_valid_mp4(out_path):

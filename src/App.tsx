@@ -711,6 +711,11 @@ export default function App() {
             // Multi-Segment Merged Highlight Video
             render_mode: settings.renderMode || 'separate',
             compilation_title: settings.compilationTitle || null,
+            // B-Roll Auto-Insert
+            broll_enabled: settings.brollEnabled || false,
+            broll_mode: settings.brollMode || 'replace',
+            broll_duration: settings.brollDuration !== undefined ? settings.brollDuration : 3,
+            broll_max_segments: settings.brollMaxSegments !== undefined ? settings.brollMaxSegments : 3,
           },
           transcript: result.transcript,
         }),

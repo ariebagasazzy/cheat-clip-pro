@@ -470,6 +470,14 @@ export const ClipStudioSection: React.FC<ClipStudioSectionProps> = ({
   const [watermarkY, setWatermarkY] = useState<number>(8);
   const [isUploadingWatermark, setIsUploadingWatermark] = useState<boolean>(false);
   const [isWatermarkDragging, setIsWatermarkDragging] = useState<boolean>(false);
+  
+  // B-Roll Auto-Insert state
+  const [brollEnabled, setBrollEnabled] = useState<boolean>(false);
+  const [brollMode, setBrollMode] = useState<'replace' | 'pip' | 'split'>('replace');
+  const [brollDuration, setBrollDuration] = useState<number>(3);
+  const [brollMaxSegments, setBrollMaxSegments] = useState<number>(2);
+  const [brollApiStatus, setBrollApiStatus] = useState<'unknown' | 'ready' | 'disabled'>('unknown');
+  
   const phoneContainerRef = useRef<HTMLDivElement | null>(null);
 
   const [isLocalhost] = useState<boolean>(() => {
@@ -1546,6 +1554,24 @@ export const ClipStudioSection: React.FC<ClipStudioSectionProps> = ({
     }
   };
 
+  // Check B-Roll API status on mount
+  useEffect(() => {
+    const checkBrollStatus = async () => {
+      try {
+        const res = await fetch('/api/broll/status');
+        if (res.ok) {
+          const data = await res.json();
+          setBrollApiStatus(data.enabled ? 'ready' : 'disabled');
+        } else {
+          setBrollApiStatus('disabled');
+        }
+      } catch {
+        setBrollApiStatus('disabled');
+      }
+    };
+    checkBrollStatus();
+  }, []);
+
   const applyLetterCase = (text: string, style: TextCaseOption): string => {
     if (style === 'uppercase') return text.toUpperCase();
     if (style === 'lowercase') return text.toLowerCase();
@@ -2001,6 +2027,11 @@ export const ClipStudioSection: React.FC<ClipStudioSectionProps> = ({
       // Multi-Segment Merged Highlight Video
       renderMode,
       compilationTitle: compilationTitle.trim() || undefined,
+      // B-Roll Auto-Insert
+      brollEnabled: brollEnabled && brollApiStatus === 'ready',
+      brollMode,
+      brollDuration,
+      brollMaxSegments,
     });
   };
 
@@ -4100,6 +4131,158 @@ export const ClipStudioSection: React.FC<ClipStudioSectionProps> = ({
                   </div>
 
                   <p className="bgm-hint-text">{t.studio.watermarkDragHint}</p>
+                </div>
+              </div>
+            )}
+          </div>
+
+          {/* 9. B-Roll Auto-Insert (Stock Footage) */}
+          <div className="studio-card-group group-broll" style={!brollEnabled ? { padding: '1rem 1.4rem' } : undefined}>
+            <div className="group-header" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: brollEnabled ? '0.85rem' : 0 }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '0.6rem' }}>
+                <span className="group-title" style={{ margin: 0 }}>🎬 B-Roll Auto-Insert</span>
+                <label style={{ display: 'inline-flex', alignItems: 'center', cursor: 'pointer', margin: 0 }}>
+                  <input
+                    type="checkbox"
+                    checked={brollEnabled}
+                    onChange={e => setBrollEnabled(e.target.checked)}
+                    style={{ accentColor: 'var(--primary)', width: '15px', height: '15px', cursor: 'pointer', margin: 0 }}
+                    disabled={brollApiStatus !== 'ready'}
+                  />
+                </label>
+                <span className={`status-pill ${brollEnabled && brollApiStatus === 'ready' ? 'pill-active' : ''}`} style={{ fontSize: '0.68rem', padding: '0.15rem 0.5rem', fontWeight: 500 }}>
+                  {brollApiStatus === 'no_key' ? '⚠️ API Key Required' : brollApiStatus === 'error' ? '❌ Error' : brollEnabled ? '✓ Enabled' : 'Disabled'}
+                </span>
+              </div>
+            </div>
+
+            {brollApiStatus === 'no_key' && (
+              <div style={{ background: 'rgba(251, 191, 36, 0.12)', border: '1px solid rgba(251, 191, 36, 0.3)', borderRadius: '8px', padding: '0.75rem 1rem', marginBottom: brollEnabled ? '0.75rem' : 0 }}>
+                <p style={{ margin: 0, fontSize: '0.78rem', color: '#fbbf24', lineHeight: 1.5 }}>
+                  ⚠️ <strong>Pixabay API Key required.</strong> Add <code style={{ background: 'rgba(0,0,0,0.3)', padding: '0.1rem 0.35rem', borderRadius: '3px' }}>PIXABAY_API_KEY</code> to your backend <code>.env</code> file to enable B-Roll auto-insert.
+                  <br />
+                  <a href="https://pixabay.com/api/docs/" target="_blank" rel="noopener noreferrer" style={{ color: '#60a5fa', textDecoration: 'underline' }}>Get free API key →</a>
+                </p>
+              </div>
+            )}
+
+            {brollEnabled && brollApiStatus === 'ready' && (
+              <div className="group-content" style={{ marginTop: '0.6rem' }}>
+                <p style={{ fontSize: '0.74rem', color: 'var(--text-muted)', margin: '0 0 0.85rem 0', lineHeight: 1.45 }}>
+                  Automatically insert relevant stock footage from Pexels based on transcript keywords. B-Roll clips will be inserted at optimal moments to enhance visual storytelling.
+                </p>
+
+                {/* Insert Mode Selection */}
+                <div style={{ marginBottom: '1rem' }}>
+                  <span style={{ fontSize: '0.78rem', color: 'var(--text-secondary)', fontWeight: 600, display: 'block', marginBottom: '0.5rem' }}>Insert Mode</span>
+                  <div className="toggle-pill-group" style={{ display: 'flex', gap: '0.5rem' }}>
+                    <button
+                      type="button"
+                      className={`pill-btn ${brollMode === 'replace' ? 'active' : ''}`}
+                      onClick={() => setBrollMode('replace')}
+                      style={{ flex: 1, padding: '0.5rem 0.75rem', fontSize: '0.75rem' }}
+                    >
+                      <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '0.2rem' }}>
+                        <span style={{ fontWeight: 600 }}>🔄 Replace</span>
+                        <span style={{ fontSize: '0.68rem', opacity: 0.7 }}>Full screen B-Roll</span>
+                      </div>
+                    </button>
+                    <button
+                      type="button"
+                      className={`pill-btn ${brollMode === 'pip' ? 'active' : ''}`}
+                      onClick={() => setBrollMode('pip')}
+                      style={{ flex: 1, padding: '0.5rem 0.75rem', fontSize: '0.75rem' }}
+                    >
+                      <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '0.2rem' }}>
+                        <span style={{ fontWeight: 600 }}>📺 PiP</span>
+                        <span style={{ fontSize: '0.68rem', opacity: 0.7 }}>Picture-in-Picture</span>
+                      </div>
+                    </button>
+                    <button
+                      type="button"
+                      className={`pill-btn ${brollMode === 'split' ? 'active' : ''}`}
+                      onClick={() => setBrollMode('split')}
+                      style={{ flex: 1, padding: '0.5rem 0.75rem', fontSize: '0.75rem' }}
+                    >
+                      <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '0.2rem' }}>
+                        <span style={{ fontWeight: 600 }}>⬛ Split</span>
+                        <span style={{ fontSize: '0.68rem', opacity: 0.7 }}>50/50 Layout</span>
+                      </div>
+                    </button>
+                  </div>
+                </div>
+
+                {/* B-Roll Duration Slider */}
+                <div className="slider-control-item" style={{ marginBottom: '1rem' }}>
+                  <div className="slider-label-row">
+                    <span className="slider-label">B-Roll Duration (per segment)</span>
+                    <div className="slider-input-badge-wrap">
+                      <input
+                        type="number"
+                        className="slider-number-input"
+                        min={1}
+                        max={10}
+                        step={0.5}
+                        value={brollDuration}
+                        onChange={e => setBrollDuration(Math.max(1, Math.min(10, Number(e.target.value) || 3)))}
+                      />
+                      <span className="slider-input-unit">sec</span>
+                    </div>
+                  </div>
+                  <input
+                    type="range"
+                    className="studio-slider"
+                    min="1"
+                    max="10"
+                    step="0.5"
+                    value={brollDuration}
+                    onChange={e => setBrollDuration(Number(e.target.value))}
+                    style={{ '--slider-progress': `${Math.max(0, Math.min(100, ((brollDuration - 1) / 9) * 100))}%` } as React.CSSProperties}
+                  />
+                  <div className="slider-quick-buttons">
+                    <button type="button" onClick={() => setBrollDuration(2)}>2s (Quick)</button>
+                    <button type="button" onClick={() => setBrollDuration(3)}>3s (Default)</button>
+                    <button type="button" onClick={() => setBrollDuration(5)}>5s (Medium)</button>
+                    <button type="button" onClick={() => setBrollDuration(8)}>8s (Long)</button>
+                  </div>
+                </div>
+
+                {/* Max Segments Slider */}
+                <div className="slider-control-item">
+                  <div className="slider-label-row">
+                    <span className="slider-label">Max B-Roll Segments</span>
+                    <div className="slider-input-badge-wrap">
+                      <input
+                        type="number"
+                        className="slider-number-input"
+                        min={1}
+                        max={10}
+                        step={1}
+                        value={brollMaxSegments}
+                        onChange={e => setBrollMaxSegments(Math.max(1, Math.min(10, Number(e.target.value) || 3)))}
+                      />
+                      <span className="slider-input-unit">clips</span>
+                    </div>
+                  </div>
+                  <input
+                    type="range"
+                    className="studio-slider"
+                    min="1"
+                    max="10"
+                    step="1"
+                    value={brollMaxSegments}
+                    onChange={e => setBrollMaxSegments(Number(e.target.value))}
+                    style={{ '--slider-progress': `${Math.max(0, Math.min(100, ((brollMaxSegments - 1) / 9) * 100))}%` } as React.CSSProperties}
+                  />
+                  <div className="slider-quick-buttons">
+                    <button type="button" onClick={() => setBrollMaxSegments(1)}>1 (Minimal)</button>
+                    <button type="button" onClick={() => setBrollMaxSegments(3)}>3 (Default)</button>
+                    <button type="button" onClick={() => setBrollMaxSegments(5)}>5 (More)</button>
+                    <button type="button" onClick={() => setBrollMaxSegments(10)}>10 (Max)</button>
+                  </div>
+                  <p className="bgm-hint-text" style={{ marginTop: '0.5rem' }}>
+                    B-Roll clips are sourced from Pixabay (free stock footage). Keywords are extracted from transcript automatically.
+                  </p>
                 </div>
               </div>
             )}

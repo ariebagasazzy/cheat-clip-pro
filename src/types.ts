@@ -155,6 +155,11 @@ export interface RenderSettings {
   // Multi-Segment Merged Highlight Video
   renderMode?: 'separate' | 'merged';
   compilationTitle?: string;
+  // B-Roll Auto-Insert
+  brollEnabled?: boolean;
+  brollMode?: 'replace' | 'pip' | 'split';
+  brollDuration?: number; // seconds per B-Roll segment
+  brollMaxSegments?: number; // max number of B-Roll segments
 }
 
 export interface RenderClipStatus {

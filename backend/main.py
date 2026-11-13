@@ -17,6 +17,7 @@ from backend.routers import (
     render_router,
     system_router,
 )
+from backend.routers.broll import router as broll_router
 # Re-exports for backwards compatibility
 from backend.schemas.analyze import (
     AnalyzeRequest,
@@ -149,6 +150,7 @@ app.include_router(media_router)
 app.include_router(cookies_router)
 app.include_router(downloads_router)
 app.include_router(system_router)
+app.include_router(broll_router)
 
 # Mount built frontend in production container if dist/ exists
 from pathlib import Path
