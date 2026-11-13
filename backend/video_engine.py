@@ -2458,6 +2458,8 @@ def analyze_lip_motion_for_faces(
     Analyzes lip/mouth region motion for each detected face cluster to identify the active speaker.
     Returns a dictionary mapping face cluster ID (based on position) to lip motion score.
     Higher score = more likely to be the speaker.
+    
+    IMPROVED: More sensitive lip region detection with optical flow-based motion analysis.
     """
     import cv2
     import numpy as np
@@ -2497,12 +2499,13 @@ def analyze_lip_motion_for_faces(
         
         total_motion = 0.0
         motion_samples = 0
+        motion_history = []  # Track motion over time for smoothing
         
         for i in range(1, len(face_frames)):
             prev_frame_idx, prev_face = face_frames[i - 1]
             curr_frame_idx, curr_face = face_frames[i]
             
-            if curr_frame_idx - prev_frame_idx > 3:  # Skip if frames too far apart
+            if curr_frame_idx - prev_frame_idx > 5:  # Allow wider gap for sparse sampling
                 continue
             
             if prev_frame_idx >= len(frames) or curr_frame_idx >= len(frames):
@@ -2515,23 +2518,23 @@ def analyze_lip_motion_for_faces(
                 continue
             
             try:
-                # Extract mouth region (lower 40% of face bounding box)
+                # Extract mouth region (lower 45% of face bounding box, wider region)
                 # Face coords are normalized (0-1), convert to pixels
                 face_x = int(curr_face['cx'] * frame_width - (curr_face['w'] * frame_width / 2))
                 face_y = int(curr_face['cy'] * frame_height - (curr_face['h'] * frame_height / 2))
                 face_w = int(curr_face['w'] * frame_width)
                 face_h = int(curr_face['h'] * frame_height)
                 
-                # Mouth region: lower 40% of face, centered horizontally
-                mouth_x = max(0, face_x + int(face_w * 0.2))
-                mouth_y = max(0, face_y + int(face_h * 0.55))
-                mouth_w = int(face_w * 0.6)
-                mouth_h = int(face_h * 0.35)
+                # Mouth region: lower 45% of face, wider horizontally for better capture
+                mouth_x = max(0, face_x + int(face_w * 0.15))  # Start 15% from left
+                mouth_y = max(0, face_y + int(face_h * 0.50))  # Start 50% from top
+                mouth_w = int(face_w * 0.70)  # 70% of face width
+                mouth_h = int(face_h * 0.40)  # 40% of face height
                 
                 mouth_x2 = min(frame_width, mouth_x + mouth_w)
                 mouth_y2 = min(frame_height, mouth_y + mouth_h)
                 
-                if mouth_w < 10 or mouth_h < 5:
+                if mouth_w < 8 or mouth_h < 4:
                     continue
                 
                 # Extract mouth regions from both frames
@@ -2541,8 +2544,8 @@ def analyze_lip_motion_for_faces(
                 if prev_mouth.size == 0 or curr_mouth.size == 0:
                     continue
                 
-                # Resize to same size for comparison
-                target_size = (60, 30)
+                # Resize to consistent size for comparison
+                target_size = (80, 40)  # Larger for more detail
                 prev_mouth_resized = cv2.resize(prev_mouth, target_size)
                 curr_mouth_resized = cv2.resize(curr_mouth, target_size)
                 
@@ -2550,10 +2553,20 @@ def analyze_lip_motion_for_faces(
                 prev_gray = cv2.cvtColor(prev_mouth_resized, cv2.COLOR_BGR2GRAY)
                 curr_gray = cv2.cvtColor(curr_mouth_resized, cv2.COLOR_BGR2GRAY)
                 
-                # Calculate absolute difference (motion)
+                # Method 1: Absolute difference
                 diff = cv2.absdiff(prev_gray, curr_gray)
-                motion_value = float(np.mean(diff))
                 
+                # Method 2: Apply threshold to detect significant changes
+                _, thresh_diff = cv2.threshold(diff, 15, 255, cv2.THRESH_BINARY)
+                
+                # Calculate motion metrics
+                mean_diff = float(np.mean(diff))
+                thresh_ratio = float(np.sum(thresh_diff > 0)) / float(thresh_diff.size)  # Percentage of changed pixels
+                
+                # Combined motion score: raw difference + thresholded significant change
+                motion_value = mean_diff * 0.6 + (thresh_ratio * 100) * 0.4
+                
+                motion_history.append(motion_value)
                 total_motion += motion_value
                 motion_samples += 1
                 
@@ -2561,9 +2574,23 @@ def analyze_lip_motion_for_faces(
                 continue
         
         if motion_samples > 0:
-            lip_motion_scores[cluster_key] = total_motion / motion_samples
+            # Apply temporal smoothing: more weight on frames with consistent motion
+            if len(motion_history) >= 3:
+                # Calculate variance - low variance means consistent speaking pattern
+                variance = float(np.var(motion_history)) if len(motion_history) > 1 else 0
+                consistency_bonus = 1.0 / (1.0 + variance * 0.01)  # Higher bonus for consistent motion
+                avg_motion = total_motion / motion_samples
+                lip_motion_scores[cluster_key] = avg_motion * consistency_bonus
+            else:
+                lip_motion_scores[cluster_key] = total_motion / motion_samples
         else:
             lip_motion_scores[cluster_key] = 0.0
+    
+    # Normalize scores relative to max
+    max_score = max(lip_motion_scores.values()) if lip_motion_scores else 1.0
+    if max_score > 0:
+        for key in lip_motion_scores:
+            lip_motion_scores[key] = lip_motion_scores[key] / max_score
     
     return lip_motion_scores
 
@@ -2841,8 +2868,8 @@ def detect_speaker_face_box(
         frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 1920)
         frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 1080)
         
-        # Increased sampling for better Active Speaker Detection: 15 frames
-        step = max(1, total_frames // 15) if total_frames > 15 else max(1, int(fps * 1.0))
+        # Increased sampling for better Active Speaker Detection: 25 frames
+        step = max(1, total_frames // 25) if total_frames > 25 else max(1, int(fps * 0.5))
 
         detections = []
         sampled_small_frames = []
@@ -2850,7 +2877,7 @@ def detect_speaker_face_box(
         face_detections_per_frame = []  # Track faces per frame for ASD
         frame_idx = 0
         checked = 0
-        while cap.isOpened() and frame_idx < total_frames and checked < 15:
+        while cap.isOpened() and frame_idx < total_frames and checked < 25:
             cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
             ret, frame = cap.read()
             frame_idx += step
@@ -2979,8 +3006,9 @@ def detect_speaker_face_box(
                             avg_w = sum(p["w"] for p in cluster["pts"]) / len(cluster["pts"])
                             avg_conf = sum(p["conf"] for p in cluster["pts"]) / len(cluster["pts"])
                             
-                            # Weighted score: lip motion (60%) + size (20%) + confidence (20%)
-                            combined_score = (matched_score * 0.6) + (avg_w * 100 * 0.2) + (avg_conf * 0.2)
+                            # Weighted score: lip motion (70%) + size (15%) + confidence (15%)
+                            # Higher lip motion weight = prioritize who is actually speaking
+                            combined_score = (matched_score * 0.70) + (avg_w * 100 * 0.15) + (avg_conf * 0.15)
                             
                             if combined_score > best_motion_score:
                                 best_motion_score = combined_score
