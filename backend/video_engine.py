@@ -1312,11 +1312,13 @@ def transcribe_clip_words(
     target_language: Optional[str] = None
 ) -> List[Dict[str, Any]]:
     """
-    Transcribes word-level timestamps directly from the sliced clip audio using Whisper AI.
-    Listens directly to the audio waveform of the sliced clip (0.0s = start of clip) for 100% acoustic accuracy.
-    Applies explicit language constraints, custom Indonesian/English initial prompt context,
-    condition_on_previous_text=False, and hallucination suppression to eliminate phantom/corrupted words.
-    Falls back to transcript distribution only if Whisper AI is not available.
+    Transcribes word-level timestamps for a clip segment.
+    
+    PRIORITY ORDER:
+    1. If fallback_transcript exists and has matching lines for this clip range -> use it (most reliable)
+    2. If no matching transcript -> use Whisper AI for acoustic transcription
+    
+    This ensures consistency between preview (which uses transcript) and render output.
     """
     # Auto-detect language from fallback transcript if not explicitly provided
     if not target_language and fallback_transcript:
@@ -1328,7 +1330,61 @@ def transcribe_clip_words(
         except Exception:
             pass
 
-    # 1. Primary: Run Whisper directly on sliced clip audio for exact acoustic timestamps
+    # 1. PRIMARY: Use fallback_transcript if available and has matching content for this clip range
+    if fallback_transcript and clip_end_time > clip_start_time:
+        words = []
+        for line in fallback_transcript:
+            line_text = line.get("text", "").strip()
+            if not line_text:
+                continue
+
+            cleaned_line = clean_caption_text(line_text)
+            if not cleaned_line:
+                continue
+
+            l_start = float(line.get("start", 0.0))
+            if "end" in line and float(line.get("end", 0.0)) > l_start:
+                l_end = float(line.get("end", 0.0))
+            elif "duration" in line and float(line.get("duration", 0.0)) > 0:
+                l_end = l_start + float(line.get("duration", 0.0))
+            else:
+                words_cnt = max(1, len(cleaned_line.split()))
+                l_end = l_start + max(1.8, words_cnt * 0.38)
+
+            # Include lines that overlap with the clip range (with 0.5s tolerance)
+            if l_end < clip_start_time - 0.5 or l_start > clip_end_time + 0.5:
+                continue
+            
+            # Calculate relative times within the clip
+            rel_start = max(0.0, l_start - clip_start_time)
+            rel_end = max(rel_start + 0.15, l_end - clip_start_time)
+
+            line_words = cleaned_line.split()
+            if not line_words:
+                continue
+                
+            # Natural speech timing calibration
+            raw_line_dur = max(0.4, rel_end - rel_start)
+            max_plausible_dur = len(line_words) * 0.52 + 0.25
+            spoken_dur = min(raw_line_dur, max_plausible_dur)
+            weights = [max(2, len(re.sub(r'[^a-zA-Z0-9]', '', w)) or len(w)) for w in line_words]
+            total_w = sum(weights) or 1
+            cur_s = rel_start
+            for i, w in enumerate(line_words):
+                w_dur = max(0.14, min(0.60, spoken_dur * (weights[i] / total_w)))
+                w_e = cur_s + w_dur
+                words.append({
+                    "word": w,
+                    "start": round(cur_s, 2),
+                    "end": round(w_e, 2)
+                })
+                cur_s = w_e
+        
+        if words:
+            logger.info(f"Using transcript words for clip range [{clip_start_time:.1f}s -> {clip_end_time:.1f}s] ({len(words)} words).")
+            return words
+
+    # 2. FALLBACK: Run Whisper directly on sliced clip audio if no transcript available
     whisper_model = get_whisper_model()
     if whisper_model is not None and os.path.exists(video_path):
         try:
@@ -1417,68 +1473,6 @@ def transcribe_clip_words(
                 return words
         except Exception as e:
             logger.warning(f"Whisper acoustic transcription error: {e}")
-
-    # 2. Secondary fallback: Use fallback_transcript if Whisper model is unavailable
-    if fallback_transcript:
-        words = []
-        for line in fallback_transcript:
-            line_text = line.get("text", "").strip()
-            if not line_text:
-                continue
-
-            cleaned_line = clean_caption_text(line_text)
-            if not cleaned_line:
-                continue
-
-            l_start = float(line.get("start", 0.0))
-            if "end" in line and float(line.get("end", 0.0)) > l_start:
-                l_end = float(line.get("end", 0.0))
-            elif "duration" in line and float(line.get("duration", 0.0)) > 0:
-                l_end = l_start + float(line.get("duration", 0.0))
-            else:
-                words_cnt = max(1, len(cleaned_line.split()))
-                l_end = l_start + max(1.8, words_cnt * 0.38)
-
-            if clip_end_time > clip_start_time:
-                # Include lines that overlap with the clip range
-                # A line overlaps if: line_start < clip_end AND line_end > clip_start
-                # Use wider tolerance (1.0 second) to catch edge cases
-                if l_end < clip_start_time - 1.0 or l_start > clip_end_time + 1.0:
-                    continue
-                # Clamp the relative times to the clip boundaries
-                rel_start = max(0.0, l_start - clip_start_time)
-                rel_end = max(rel_start + 0.15, l_end - clip_start_time)
-                # If the line starts before clip_start, adjust to start at 0.0
-                if l_start < clip_start_time:
-                    rel_start = 0.0
-                    # Keep the relative duration
-                    rel_end = max(0.15, l_end - clip_start_time)
-            else:
-                rel_start = max(0.0, l_start)
-                rel_end = max(rel_start + 0.15, l_end)
-
-            line_words = cleaned_line.split()
-            if not line_words:
-                continue
-            # Natural speech timing calibration: respect line duration unless trailing silence is detected
-            raw_line_dur = max(0.4, rel_end - rel_start)
-            max_plausible_dur = len(line_words) * 0.52 + 0.25
-            spoken_dur = min(raw_line_dur, max_plausible_dur)
-            weights = [max(2, len(re.sub(r'[^a-zA-Z0-9]', '', w)) or len(w)) for w in line_words]
-            total_w = sum(weights) or 1
-            cur_s = rel_start
-            for i, w in enumerate(line_words):
-                w_dur = max(0.14, min(0.60, spoken_dur * (weights[i] / total_w)))
-                w_e = cur_s + w_dur
-                words.append({
-                    "word": w,
-                    "start": round(cur_s, 2),
-                    "end": round(w_e, 2)
-                })
-                cur_s = w_e
-        if words:
-            logger.info(f"Fallback: using transcript words for clip range [{clip_start_time:.1f}s -> {clip_end_time:.1f}s].")
-            return words
 
     return []
 
