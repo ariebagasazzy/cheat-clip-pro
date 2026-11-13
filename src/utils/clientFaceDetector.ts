@@ -202,12 +202,14 @@ export async function detectFaceClientSide(
           facesDetected: faces.length
         };
       }
+      // FaceDetector found no faces - will fall through to skin-tone detection below
     } catch (e) {
       // Shape detection api failed or permission denied, fall back to canvas
     }
   }
 
   // 2. High-performance canvas skin-tone & upper-body centroid fallback (~1.5ms)
+  // Also serves as fallback when FaceDetector returns no faces
   try {
     const canvas = document.createElement('canvas');
     const sampleW = 160;
@@ -237,17 +239,24 @@ export async function detectFaceClientSide(
         const g = data[idx + 1];
         const b = data[idx + 2];
 
-        // Standard skin tone classifier in RGB color space
-        const isSkin =
-          r > 95 &&
-          g > 40 &&
-          b > 20 &&
+        // Improved skin tone classifier - works for various skin tones
+        // Method 1: RGB-based detection
+        const isSkinRGB =
+          r > 80 &&  // Lowered from 95
+          g > 30 &&  // Lowered from 40
+          b > 15 &&  // Lowered from 20
           r > g &&
           r > b &&
-          r - g > 15 &&
-          Math.max(r, g, b) - Math.min(r, g, b) > 15;
+          r - g > 10 &&  // Lowered from 15
+          Math.max(r, g, b) - Math.min(r, g, b) > 12;  // Lowered from 15
 
-        if (isSkin) {
+        // Method 2: YCrCb-style check (approximated in RGB)
+        // Cr and Cb ranges that correspond to skin tones
+        const cr = 0.5 + (0.5 * r - 0.419 * g - 0.081 * b) / 255;
+        const cb = 0.5 + (-0.169 * r - 0.331 * g + 0.5 * b) / 255;
+        const isSkinYCrCb = cr >= 0.52 && cr <= 0.68 && cb >= 0.30 && cb <= 0.50;
+
+        if (isSkinRGB || isSkinYCrCb) {
           sumX += x;
           sumY += y;
           count++;
@@ -255,7 +264,8 @@ export async function detectFaceClientSide(
       }
     }
 
-    if (count > 25) {
+    // Lower threshold for skin detection (from 25 to 15)
+    if (count > 15) {
       const avgX = sumX / count;
       const avgY = sumY / count;
       const cx = Math.max(0.18, Math.min(0.82, avgX / sampleW));
