@@ -2703,6 +2703,7 @@ def detect_speaker_face_box(
 
     try:
         import cv2
+        import numpy as np
 
         # Check if source is image
         ext = os.path.splitext(source_path)[1].lower()
@@ -2721,7 +2722,7 @@ def detect_speaker_face_box(
                     str(target_model),
                     "",
                     (320, 320),
-                    0.65,  # score_threshold: strict enough to reject walls and noise
+                    0.50,  # LOWERED: from 0.65 to 0.50 to catch profile/side faces better
                     0.3,   # nms_threshold
                     5000
                 )
@@ -2729,14 +2730,14 @@ def detect_speaker_face_box(
                 logger.warning(f"YuNet initialization failed: {e}")
                 yunet_detector = None
 
-        # 2. Prepare Haar Cascades fallback ensemble
+        # 2. Prepare Haar Cascades fallback ensemble (profile face prioritized)
         cascades = []
         cascade_names = [
+            "haarcascade_profileface.xml",  # MOVED UP: prioritize profile/side face detection
             "haarcascade_frontalface_alt2.xml",
             "haarcascade_frontalface_alt.xml",
-            "haarcascade_profileface.xml",
-            "haarcascade_upperbody.xml",
-            "haarcascade_frontalface_default.xml"
+            "haarcascade_frontalface_default.xml",
+            "haarcascade_upperbody.xml"
         ]
         opencv_data_dir = getattr(cv2, "data", None)
         haarcascades_dir = getattr(opencv_data_dir, "haarcascades", None) if opencv_data_dir else None
@@ -2809,6 +2810,58 @@ def detect_speaker_face_box(
                                 })
                         if found_faces:
                             break
+
+            # Stage C: Skin-tone centroid detection fallback (for profile/side faces)
+            if not found_faces:
+                try:
+                    # Convert to YCrCb color space for better skin detection
+                    ycrcb = cv2.cvtColor(frame, cv2.COLOR_BGR2YCrCb)
+                    
+                    # Skin color range in YCrCb (works for various skin tones)
+                    lower_skin = np.array([0, 133, 77], dtype=np.uint8)
+                    upper_skin = np.array([255, 173, 127], dtype=np.uint8)
+                    skin_mask = cv2.inRange(ycrcb, lower_skin, upper_skin)
+                    
+                    # Morphological operations to clean up the mask
+                    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+                    skin_mask = cv2.morphologyEx(skin_mask, cv2.MORPH_CLOSE, kernel)
+                    skin_mask = cv2.morphologyEx(skin_mask, cv2.MORPH_OPEN, kernel)
+                    
+                    # Find contours of skin regions
+                    contours, _ = cv2.findContours(skin_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                    
+                    if contours:
+                        # Find the largest skin region in upper half of frame (likely face)
+                        upper_contours = []
+                        for cnt in contours:
+                            M = cv2.moments(cnt)
+                            if M["m00"] > 0:
+                                cy = int(M["m01"] / M["m00"])
+                                # Only consider skin regions in upper 60% of frame
+                                if cy < fh * 0.6:
+                                    area = cv2.contourArea(cnt)
+                                    if area > (fh * fw * 0.005):  # At least 0.5% of frame
+                                        upper_contours.append((cnt, area))
+                        
+                        if upper_contours:
+                            # Get largest upper skin region
+                            largest = max(upper_contours, key=lambda x: x[1])
+                            cnt = largest[0]
+                            x, y, bw, bh = cv2.boundingRect(cnt)
+                            
+                            # Check aspect ratio is reasonable for a face
+                            aspect = float(bw) / float(bh) if bh > 0 else 0
+                            if 0.4 <= aspect <= 2.0:  # Wider range for profile faces
+                                fcx = float(x + bw / 2.0) / fw
+                                fcy = float(y + bh / 2.0) / fh
+                                found_faces.append({
+                                    "cx": fcx, "cy": fcy,
+                                    "w": float(bw) / fw, "h": float(bh) / fh,
+                                    "conf": 0.55, "source": "skin_tone"
+                                })
+                                logger.debug(f"Skin-tone fallback detected face region at ({fcx:.2f}, {fcy:.2f})")
+                except Exception as skin_err:
+                    logger.debug(f"Skin-tone detection failed: {skin_err}")
 
             return found_faces
 
