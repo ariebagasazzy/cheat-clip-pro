@@ -1440,10 +1440,19 @@ def transcribe_clip_words(
                 l_end = l_start + max(1.8, words_cnt * 0.38)
 
             if clip_end_time > clip_start_time:
-                if l_end < clip_start_time - 0.2 or l_start > clip_end_time + 0.2:
+                # Include lines that overlap with the clip range
+                # A line overlaps if: line_start < clip_end AND line_end > clip_start
+                # Use wider tolerance (1.0 second) to catch edge cases
+                if l_end < clip_start_time - 1.0 or l_start > clip_end_time + 1.0:
                     continue
+                # Clamp the relative times to the clip boundaries
                 rel_start = max(0.0, l_start - clip_start_time)
                 rel_end = max(rel_start + 0.15, l_end - clip_start_time)
+                # If the line starts before clip_start, adjust to start at 0.0
+                if l_start < clip_start_time:
+                    rel_start = 0.0
+                    # Keep the relative duration
+                    rel_end = max(0.15, l_end - clip_start_time)
             else:
                 rel_start = max(0.0, l_start)
                 rel_end = max(rel_start + 0.15, l_end)
