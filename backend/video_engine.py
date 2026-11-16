@@ -2636,6 +2636,338 @@ def detect_video_saliency_and_motion_center(sampled_small_frames: List[Any]) -> 
     return 0.50, 0.35
 
 
+def detect_progressive_face_tracking(
+    source_path: str,
+    segment_duration: float = 2.0,
+    facecam_position: str = "auto",
+    streamer_preset: str = "none"
+) -> List[Dict[str, Any]]:
+    """
+    Progressive face tracking that detects face position changes throughout the video.
+    Returns a list of keyframes with timestamp and crop position for smooth transitions.
+    
+    Returns:
+    [
+        {"t": 0.0, "cx": 0.5, "cy": 0.4},
+        {"t": 2.0, "cx": 0.3, "cy": 0.4},
+        {"t": 4.0, "cx": 0.7, "cy": 0.4},
+        ...
+    ]
+    """
+    import cv2
+    
+    pos = (facecam_position or "auto").lower().strip()
+    is_streamer = streamer_preset in ["split_top_cam", "pip_corner"]
+    
+    # If manual position specified, return static keyframe
+    if pos != "auto":
+        static_positions = {
+            "bottom_right": (0.85, 0.78),
+            "top_right": (0.85, 0.22),
+            "bottom_left": (0.15, 0.78),
+            "top_left": (0.15, 0.22),
+            "center": (0.50, 0.35),
+            "left": (0.35, 0.35),
+            "right": (0.65, 0.35),
+        }
+        if pos in static_positions:
+            cx, cy = static_positions[pos]
+            return [{"t": 0.0, "cx": cx, "cy": cy}]
+    
+    default_cx = 0.85 if is_streamer else 0.50
+    default_cy = 0.78 if is_streamer else 0.40
+    
+    if not source_path or not os.path.exists(source_path):
+        return [{"t": 0.0, "cx": default_cx, "cy": default_cy}]
+    
+    try:
+        cap = cv2.VideoCapture(source_path)
+        if not cap.isOpened():
+            return [{"t": 0.0, "cx": default_cx, "cy": default_cy}]
+        
+        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        duration = total_frames / fps if fps > 0 else 0
+        
+        if duration <= 0:
+            cap.release()
+            return [{"t": 0.0, "cx": default_cx, "cy": default_cy}]
+        
+        # Initialize YuNet detector
+        yunet_detector = None
+        for cand in [YUNET_MODEL_PATH, BASE_DIR / "face_detection_yunet.onnx", BASE_DIR / "cascades" / "face_detection_yunet.onnx"]:
+            if cand.exists():
+                try:
+                    yunet_detector = cv2.FaceDetectorYN.create(str(cand), "", (320, 320), 0.6, 0.3, 5000)
+                    break
+                except:
+                    pass
+        
+        # Load Haar cascades as fallback
+        cascades = []
+        cascade_names = ["haarcascade_frontalface_alt2.xml", "haarcascade_profileface.xml"]
+        opencv_data_dir = getattr(cv2, "data", None)
+        haarcascades_dir = getattr(opencv_data_dir, "haarcascades", None) if opencv_data_dir else None
+        
+        for c_name in cascade_names:
+            candidates = [
+                CASCADES_DIR / c_name,
+                BASE_DIR / c_name,
+                os.path.join(haarcascades_dir, c_name) if haarcascades_dir else ""
+            ]
+            for p in candidates:
+                if p and os.path.exists(str(p)):
+                    try:
+                        c = cv2.CascadeClassifier(str(p))
+                        if not c.empty():
+                            cascades.append((c_name, c))
+                            break
+                    except:
+                        pass
+        
+        def detect_face_in_frame(frame):
+            """Detect face center in a single frame"""
+            fh, fw = frame.shape[:2]
+            
+            # Try YuNet first
+            if yunet_detector is not None:
+                try:
+                    yunet_detector.setInputSize((fw, fh))
+                    res = yunet_detector.detect(frame)
+                    if res[1] is not None and len(res[1]) > 0:
+                        # Find largest face
+                        best_face = max(res[1], key=lambda f: f[2] * f[3])
+                        box = best_face[0:4]
+                        cx = float(box[0] + box[2] / 2.0) / fw
+                        cy = float(box[1] + box[3] / 2.0) / fh
+                        w = float(box[2]) / fw
+                        if w >= 0.03:  # Minimum face size
+                            return cx, cy, float(best_face[-1])
+                except:
+                    pass
+            
+            # Fallback to Haar cascades
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            gray_flipped = cv2.flip(gray, 1)
+            min_sz = max(48, int(fh * 0.06))
+            
+            for c_name, cascade in cascades:
+                is_profile = "profile" in c_name
+                
+                faces = cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(min_sz, min_sz))
+                if len(faces) > 0:
+                    best = max(faces, key=lambda f: f[2] * f[3])
+                    cx = float(best[0] + best[2] / 2.0) / fw
+                    cy = float(best[1] + best[3] / 2.0) / fh
+                    return cx, cy, 0.7
+                
+                # For profile, also check flipped
+                if is_profile:
+                    faces_flip = cascade.detectMultiScale(gray_flipped, scaleFactor=1.1, minNeighbors=5, minSize=(min_sz, min_sz))
+                    if len(faces_flip) > 0:
+                        best = max(faces_flip, key=lambda f: f[2] * f[3])
+                        cx = float(fw - (best[0] + best[2] / 2.0)) / fw
+                        cy = float(best[1] + best[3] / 2.0) / fh
+                        return cx, cy, 0.65
+            
+            return None, None, 0
+        
+        # Sample frames at each segment and count layout types
+        keyframes = []
+        num_segments = max(1, int(duration / segment_duration))
+        
+        logger.info(f"Progressive face tracking: analyzing {num_segments} segments ({segment_duration}s each) for {duration:.1f}s video")
+        
+        no_face_count = 0  # Segments where no face detected (likely side profile)
+        single_count = 0
+        prev_cx = default_cx
+        
+        for seg_idx in range(num_segments):
+            seg_start = seg_idx * segment_duration
+            seg_mid = seg_start + segment_duration / 2.0
+            frame_num = int(seg_mid * fps)
+            
+            if frame_num >= total_frames:
+                frame_num = total_frames - 1
+            
+            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_num)
+            ret, frame = cap.read()
+            
+            if not ret or frame is None:
+                keyframes.append({"t": seg_start, "cx": prev_cx, "cy": default_cy, "conf": 0.3, "type": "unknown"})
+                no_face_count += 1
+                continue
+            
+            # Detect faces
+            fh, fw = frame.shape[:2]
+            faces = []
+            
+            if yunet_detector is not None:
+                try:
+                    yunet_detector.setInputSize((fw, fh))
+                    res = yunet_detector.detect(frame)
+                    if res[1] is not None:
+                        for f in res[1]:
+                            box = f[0:4]
+                            conf = float(f[-1])
+                            if conf >= 0.5:
+                                cx = float(box[0] + box[2] / 2.0) / fw
+                                w = float(box[2]) / fw
+                                if w >= 0.03:
+                                    faces.append({"cx": cx, "conf": conf, "w": w})
+                except:
+                    pass
+            
+            if len(faces) == 0:
+                # NO FACE DETECTED - likely side profile or podcast with 2 people facing each other
+                no_face_count += 1
+                keyframes.append({"t": seg_start, "cx": prev_cx, "cy": default_cy, "conf": 0.2, "type": "no_face"})
+                continue
+            
+            # Categorize faces by position
+            left_faces = [f for f in faces if f["cx"] < 0.35]
+            right_faces = [f for f in faces if f["cx"] > 0.65]
+            center_faces = [f for f in faces if 0.35 <= f["cx"] <= 0.65]
+            
+            # Check for PODCAST layout: 2 faces on opposite sides (interview/podcast setup)
+            # This happens when both speakers are visible but positioned at extreme left and right
+            if left_faces and right_faces:
+                # Two faces on opposite sides = PODCAST LAYOUT
+                no_face_count += 1  # Treat as "needs split screen"
+                keyframes.append({"t": seg_start, "cx": 0.50, "cy": 0.40, "conf": 0.7, "type": "podcast_dual"})
+                continue
+            
+            if center_faces:
+                # Single speaker detected in center
+                single_count += 1
+                best = max(center_faces, key=lambda f: f["w"])
+                cx = max(0.25, min(0.75, best["cx"]))
+                if 0.45 <= cx <= 0.55:
+                    cx = 0.50
+                keyframes.append({"t": seg_start, "cx": cx, "cy": 0.40, "conf": 0.85, "type": "single"})
+                prev_cx = cx
+            elif len(faces) >= 1:
+                # Single face detected but not center - track to it
+                single_count += 1
+                best = max(faces, key=lambda f: f["w"])
+                cx = max(0.20, min(0.80, best["cx"]))
+                keyframes.append({"t": seg_start, "cx": cx, "cy": 0.40, "conf": best["conf"], "type": "single"})
+                prev_cx = cx
+            else:
+                no_face_count += 1
+                keyframes.append({"t": seg_start, "cx": prev_cx, "cy": default_cy, "conf": 0.3, "type": "unknown"})
+        
+        cap.release()
+        
+        # Determine layout distribution
+        total_segments = num_segments
+        no_face_ratio = no_face_count / max(1, total_segments)
+        
+        logger.info(f"Layout analysis: split_needed={no_face_count}, single={single_count}, split_ratio={no_face_ratio:.2f}")
+        
+        if not keyframes:
+            return [{"t": 0.0, "cx": default_cx, "cy": default_cy, "type": "single"}]
+        
+        # HYBRID MODE: Return all keyframes with their types
+        # The renderer will handle switching between face tracking and split screen per segment
+        # Group consecutive segments of the same type for efficiency
+        
+        # First, mark segments that need split screen
+        for kf in keyframes:
+            if kf.get("type") in ["no_face", "podcast_dual", "unknown"]:
+                kf["layout"] = "split"
+                kf["left_cx"] = 0.15
+                kf["right_cx"] = 0.85
+            else:
+                kf["layout"] = "track"
+        
+        # Merge consecutive segments with same layout type
+        merged_segments = []
+        current_segment = None
+        
+        for kf in keyframes:
+            if current_segment is None:
+                current_segment = {
+                    "t_start": kf["t"],
+                    "t_end": kf["t"] + segment_duration,
+                    "layout": kf["layout"],
+                    "cx": kf.get("cx", 0.5),
+                    "left_cx": kf.get("left_cx", 0.15),
+                    "right_cx": kf.get("right_cx", 0.85),
+                    "keyframes": [kf]
+                }
+            elif kf["layout"] == current_segment["layout"]:
+                # Same layout, extend the segment
+                current_segment["t_end"] = kf["t"] + segment_duration
+                current_segment["keyframes"].append(kf)
+                # Update cx to latest for tracking segments
+                if kf["layout"] == "track":
+                    current_segment["cx"] = kf.get("cx", current_segment["cx"])
+            else:
+                # Different layout, save current and start new
+                merged_segments.append(current_segment)
+                current_segment = {
+                    "t_start": kf["t"],
+                    "t_end": kf["t"] + segment_duration,
+                    "layout": kf["layout"],
+                    "cx": kf.get("cx", 0.5),
+                    "left_cx": kf.get("left_cx", 0.15),
+                    "right_cx": kf.get("right_cx", 0.85),
+                    "keyframes": [kf]
+                }
+        
+        if current_segment:
+            merged_segments.append(current_segment)
+        
+        # Check if we have mixed content (hybrid mode needed)
+        has_split = any(seg["layout"] == "split" for seg in merged_segments)
+        has_track = any(seg["layout"] == "track" for seg in merged_segments)
+        
+        if has_split and has_track:
+            logger.info(f"HYBRID MODE: {len(merged_segments)} segments (mixed split/track)")
+            for seg in merged_segments:
+                logger.info(f"  {seg['t_start']:.1f}s-{seg['t_end']:.1f}s: {seg['layout']} (cx={seg['cx']:.2f})")
+            
+            # Return special hybrid keyframe list
+            return [{
+                "t": 0.0,
+                "type": "hybrid",
+                "segments": merged_segments,
+                "total_duration": duration
+            }]
+        elif has_split and not has_track:
+            # All split - use full split screen mode
+            logger.info("FULL SPLIT SCREEN MODE - all segments need split")
+            return [{"t": 0.0, "cx": 0.50, "cy": 0.40, "conf": 0.9, 
+                     "type": "podcast_split", "left_cx": 0.15, "right_cx": 0.85}]
+        else:
+            # All tracking or mostly tracking - use face tracking with keyframes
+            logger.info(f"FACE TRACKING MODE: {len(keyframes)} keyframes")
+            
+            # Smooth keyframes for face tracking
+            smoothed = [keyframes[0]]
+            for kf in keyframes[1:]:
+                if kf.get("layout") == "split":
+                    continue
+                if abs(kf["cx"] - smoothed[-1]["cx"]) > 0.12 and kf.get("conf", 0) >= 0.6:
+                    smoothed.append(kf)
+            
+            if not smoothed:
+                return [{"t": 0.0, "cx": default_cx, "cy": default_cy, "type": "single"}]
+            
+            logger.info(f"Progressive tracking: {len(smoothed)} keyframes")
+            for kf in smoothed:
+                logger.info(f"  t={kf['t']:.1f}s: cx={kf['cx']:.3f}")
+            
+            return smoothed
+        
+        return smoothed
+        
+    except Exception as e:
+        logger.warning(f"Progressive face tracking error: {e}")
+        return [{"t": 0.0, "cx": default_cx, "cy": default_cy}]
+
+
 def detect_speaker_face_box(
     source_path: str,
     facecam_position: str = "auto",
@@ -2766,17 +3098,24 @@ def detect_speaker_face_box(
             if cascades:
                 gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
                 min_sz = max(48, int(fh * 0.08))  # Minimum 8% of frame height (reject wall specks)
-                for cascade in cascades:
+                
+                # Also prepare flipped frame for profile face detection (faces looking right)
+                gray_flipped = cv2.flip(gray, 1)
+                
+                for i, cascade in enumerate(cascades):
+                    is_profile_cascade = "profileface" in cascade_names[i] if i < len(cascade_names) else False
+                    
+                    # Detect on original frame
                     haar_faces = cascade.detectMultiScale(
                         gray,
                         scaleFactor=1.1,
-                        minNeighbors=6,
+                        minNeighbors=5 if is_profile_cascade else 6,
                         minSize=(min_sz, min_sz)
                     )
                     if len(haar_faces) > 0:
                         for (fx, fy, bw, bh) in haar_faces:
                             aspect = float(bw) / float(bh)
-                            if 0.65 <= aspect <= 1.35:
+                            if 0.55 <= aspect <= 1.45:  # Slightly relaxed for profile faces
                                 fcx = float(fx + bw / 2.0) / fw
                                 fcy = float(fy + bh / 2.0) / fh
                                 found_faces.append({
@@ -2784,8 +3123,30 @@ def detect_speaker_face_box(
                                     "w": float(bw) / fw, "h": float(bh) / fh,
                                     "conf": 0.70, "source": "haar"
                                 })
-                        if found_faces:
-                            break
+                    
+                    # For profile cascade, also check flipped frame to detect faces looking right
+                    if is_profile_cascade:
+                        haar_faces_flipped = cascade.detectMultiScale(
+                            gray_flipped,
+                            scaleFactor=1.1,
+                            minNeighbors=5,
+                            minSize=(min_sz, min_sz)
+                        )
+                        if len(haar_faces_flipped) > 0:
+                            for (fx, fy, bw, bh) in haar_faces_flipped:
+                                aspect = float(bw) / float(bh)
+                                if 0.55 <= aspect <= 1.45:
+                                    # Mirror the x coordinate back
+                                    fcx = float(fw - (fx + bw / 2.0)) / fw
+                                    fcy = float(fy + bh / 2.0) / fh
+                                    found_faces.append({
+                                        "cx": fcx, "cy": fcy,
+                                        "w": float(bw) / fw, "h": float(bh) / fh,
+                                        "conf": 0.65, "source": "haar_profile"
+                                    })
+                    
+                    if found_faces:
+                        break
 
             return found_faces
 
@@ -2863,9 +3224,41 @@ def detect_speaker_face_box(
 
         cap.release()
 
-        # If no face detections, run non-facecam visual saliency & motion object tracking!
+        # If no face detections, check for podcast/interview layout before saliency fallback
         if not detections:
             if not is_streamer and sampled_small_frames:
+                # Try to detect podcast layout: two people on opposite sides
+                # Check for symmetrical activity in left and right thirds of frame
+                left_activity = 0
+                right_activity = 0
+                for small_frame in sampled_small_frames:
+                    gray = cv2.cvtColor(small_frame, cv2.COLOR_BGR2GRAY)
+                    h, w = gray.shape[:2]
+                    left_third = gray[:, :w//3]
+                    right_third = gray[:, 2*w//3:]
+                    # Calculate variance as activity measure
+                    left_activity += float(left_third.std())
+                    right_activity += float(right_third.std())
+                
+                left_activity /= len(sampled_small_frames)
+                right_activity /= len(sampled_small_frames)
+                
+                # If both sides have significant activity, it's likely a podcast/interview layout
+                if left_activity > 25 and right_activity > 25:
+                    # Check if activities are roughly balanced (symmetrical layout)
+                    balance_ratio = min(left_activity, right_activity) / max(left_activity, right_activity)
+                    if balance_ratio > 0.5:  # Within 2x of each other
+                        logger.info(f"Podcast/interview layout detected: left_activity={left_activity:.1f}, right_activity={right_activity:.1f}, centering at 0.5")
+                        return {
+                            "found": True,
+                            "type": "podcast_layout",
+                            "cx": 0.50,
+                            "cy": 0.40,
+                            "w": 0.30,
+                            "h": 0.30
+                        }
+                
+                # Fallback to saliency
                 sal_cx, sal_cy = detect_video_saliency_and_motion_center(sampled_small_frames)
                 logger.info(f"Non-facecam video detected: smart saliency/motion centered at ({sal_cx:.3f}, {sal_cy:.3f})")
                 return {
@@ -2893,11 +3286,22 @@ def detect_speaker_face_box(
             if not matched:
                 clusters.append({"cx": d["cx"], "cy": d["cy"], "pts": [d]})
 
+        # Debug: log all raw detections
+        logger.debug(f"Face detection raw: {len(detections)} detections across {checked} frames")
+        for i, d in enumerate(detections):
+            logger.debug(f"  Detection {i}: cx={d['cx']:.3f}, cy={d['cy']:.3f}, w={d['w']:.3f}, h={d['h']:.3f}, conf={d['conf']:.2f}, src={d['source']}")
+
         # Temporal multi-frame persistence gating
         valid_clusters = [
             c for c in clusters
             if len(c["pts"]) >= 2 or (c["pts"][0]["conf"] >= 0.85 and c["pts"][0]["w"] >= 0.08)
         ]
+        
+        # Debug: log clusters
+        logger.debug(f"Face clusters: {len(clusters)} total, {len(valid_clusters)} valid (>=2 pts or high conf)")
+        for i, c in enumerate(valid_clusters):
+            avg_w = sum(p["w"] for p in c["pts"]) / len(c["pts"])
+            logger.debug(f"  Cluster {i}: cx={c['cx']:.3f}, cy={c['cy']:.3f}, pts={len(c['pts'])}, avg_w={avg_w:.3f}")
         if not valid_clusters:
             # Low confidence / isolated noise blips -> fallback to saliency/motion
             if not is_streamer and sampled_small_frames:
@@ -2944,11 +3348,22 @@ def detect_speaker_face_box(
                 return {"found": True, "cx": float(round(mid_cx, 3)), "cy": 0.35, "w": 0.25, "h": 0.25, "dual_speakers": True}
 
             # Rank foreground candidates by: consistency * size * confidence * center prior
+            # Prioritize larger faces (main speaker) over small faces that appear more frequently
             def score_cluster(c):
                 avg_w = sum(p["w"] for p in c["pts"]) / len(c["pts"])
                 avg_conf = sum(p["conf"] for p in c["pts"]) / len(c["pts"])
-                center_prior = 1.0 - 0.35 * abs(c["cx"] - 0.5)
-                return len(c["pts"]) * (avg_w ** 0.5) * avg_conf * center_prior
+                center_prior = 1.0 - 0.25 * abs(c["cx"] - 0.5)  # Reduced center bias
+                # Size is more important: larger faces are likely the main speaker
+                # Use sqrt of pts count to reduce impact of frame count
+                size_factor = avg_w ** 0.8  # Stronger weight on size
+                consistency_factor = len(c["pts"]) ** 0.4  # Reduced weight on frame count
+                return size_factor * consistency_factor * avg_conf * center_prior
+
+            # Log all foreground candidates with scores
+            for c in foreground_clusters:
+                avg_w = sum(p["w"] for p in c["pts"]) / len(c["pts"])
+                score = score_cluster(c)
+                logger.info(f"  Foreground candidate: cx={c['cx']:.3f}, pts={len(c['pts'])}, avg_w={avg_w:.3f}, score={score:.4f}")
 
             chosen = max(foreground_clusters, key=score_cluster)
 
@@ -2999,7 +3414,8 @@ def build_ffmpeg_filtergraph(
     ass_subtitles_path: Optional[str] = None,
     face_box: Optional[Dict[str, Any]] = None,
     title_y_percent: Optional[float] = None,
-    crop_x_percent: Optional[float] = None
+    crop_x_percent: Optional[float] = None,
+    face_keyframes: Optional[List[Dict[str, Any]]] = None
 ) -> Tuple[str, str]:
     """
     Constructs the FFmpeg -filter_complex chain with proper aspect ratio center-cropping.
@@ -3016,7 +3432,8 @@ def build_ffmpeg_filtergraph(
         ass_subtitles_path=ass_subtitles_path,
         face_box=face_box,
         title_y_percent=title_y_percent,
-        crop_x_percent=crop_x_percent
+        crop_x_percent=crop_x_percent,
+        face_keyframes=face_keyframes
     )
 
 
@@ -3121,6 +3538,276 @@ def _run_ffmpeg_command_with_progress(
     return process.returncode, stderr_text
 
 
+def render_hybrid_clip(
+    video_path: str,
+    output_path: str,
+    segments: List[Dict[str, Any]],
+    total_duration: float,
+    aspect_ratio: str = "9:16",
+    background_style: str = "black",
+    streamer_preset: str = "none",
+    title_text: Optional[str] = None,
+    title_position: str = "auto",
+    title_overlay_path: Optional[str] = None,
+    title_duration: str = "entire",
+    title_y_percent: Optional[float] = None,
+    ass_subtitles_path: Optional[str] = None,
+    watermark_enabled: bool = False,
+    watermark_type: str = "image",
+    watermark_text: Optional[str] = None,
+    watermark_image_path: Optional[str] = None,
+    watermark_size: float = 20.0,
+    watermark_opacity: float = 0.8,
+    watermark_x_percent: float = 90.0,
+    watermark_y_percent: float = 8.0,
+    hw_accel: str = "auto",
+    hw_accel_preset: Optional[str] = None,
+    bgm_path: Optional[str] = None,
+    bgm_volume: float = 0.25
+) -> str:
+    """
+    Render a hybrid clip with mixed face-tracking and split-screen segments.
+    Renders each segment separately with appropriate layout, then concatenates.
+    """
+    import tempfile
+    from pathlib import Path
+    
+    logger.info(f"HYBRID RENDER: {len(segments)} segments to process")
+    
+    temp_dir = Path(video_path).parent
+    segment_files = []
+    
+    try:
+        for idx, seg in enumerate(segments):
+            seg_start = seg["t_start"]
+            seg_end = seg["t_end"]
+            seg_duration = seg_end - seg_start
+            layout = seg["layout"]
+            
+            logger.info(f"  Segment {idx+1}: {seg_start:.1f}s-{seg_end:.1f}s ({layout})")
+            
+            # Create temp output for this segment
+            seg_output = temp_dir / f"hybrid_seg_{idx}_{int(time.time())}.mp4"
+            segment_files.append(str(seg_output))
+            
+            # Prepare face_box based on layout
+            if layout == "split":
+                face_box = {
+                    "found": True,
+                    "type": "podcast_split",
+                    "cx": 0.5,
+                    "cy": 0.4,
+                    "left_cx": seg.get("left_cx", 0.15),
+                    "right_cx": seg.get("right_cx", 0.85),
+                    "w": 0.22,
+                    "h": 0.25
+                }
+                face_keyframes = None
+            else:
+                # Face tracking mode
+                face_box = {
+                    "found": True,
+                    "cx": seg.get("cx", 0.5),
+                    "cy": 0.4,
+                    "w": 0.22,
+                    "h": 0.25
+                }
+                # Build keyframes from segment's keyframes if available
+                seg_keyframes = seg.get("keyframes", [])
+                if seg_keyframes:
+                    # Adjust timestamps relative to segment start (segment extracted starts at 0)
+                    face_keyframes = []
+                    for kf in seg_keyframes:
+                        adjusted_kf = kf.copy()
+                        adjusted_kf["t"] = max(0, kf["t"] - seg_start)
+                        face_keyframes.append(adjusted_kf)
+                else:
+                    face_keyframes = [{"t": 0.0, "cx": seg.get("cx", 0.5), "cy": 0.4}]
+            
+            # Build filtergraph for this segment
+            filter_complex, out_video_map = build_ffmpeg_filtergraph(
+                aspect_ratio=aspect_ratio,
+                background_style=background_style,
+                face_center_ratio=float(face_box.get("cx", 0.5)),
+                streamer_preset=streamer_preset,
+                title_text=None,  # No title on segments, add at final concat
+                title_position=title_position,
+                ass_subtitles_path=None,  # No subtitles on segments
+                face_box=face_box,
+                title_y_percent=title_y_percent,
+                crop_x_percent=None,
+                face_keyframes=face_keyframes if layout == "track" else None
+            )
+            
+            # Get encoder
+            encoder, enc_flags = resolve_encoder(hw_accel)
+            
+            # Build ffmpeg command - seek directly from source video
+            # Use -ss before -i for fast seeking, then -t for duration
+            cmd = [
+                "ffmpeg", "-y",
+                "-ss", str(seg_start),
+                "-i", video_path,
+                "-t", str(seg_duration),
+                "-filter_complex", filter_complex,
+                "-map", out_video_map, "-map", "0:a?"
+            ]
+            cmd.extend(["-c:v", encoder])
+            cmd.extend(enc_flags)
+            cmd.extend(["-c:a", "aac", "-b:a", "128k"])
+            cmd.extend(["-movflags", "+faststart"])
+            cmd.append(str(seg_output))
+            
+            logger.info(f"  Rendering segment {idx+1} with {layout} layout (ss={seg_start:.1f}, t={seg_duration:.1f})...")
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+            
+            if result.returncode != 0:
+                logger.warning(f"Failed to render segment {idx}: {result.stderr[:500]}")
+        
+        # Filter out failed segments
+        valid_segments = [f for f in segment_files if os.path.exists(f) and os.path.getsize(f) > 0]
+        
+        if not valid_segments:
+            logger.error("No valid segments rendered, falling back to simple render")
+            # Fallback to simple center crop
+            return render_clip_to_mp4(
+                video_path=video_path,
+                output_mp4_path=output_path,
+                aspect_ratio=aspect_ratio,
+                background_style=background_style,
+                enable_face_tracking=False,
+                streamer_preset=streamer_preset,
+                clip_duration=total_duration,
+                hw_accel_selection=hw_accel
+            )
+        
+        logger.info(f"Concatenating {len(valid_segments)} segments...")
+        
+        # Create concat list file
+        concat_list = temp_dir / f"concat_list_{int(time.time())}.txt"
+        with open(concat_list, "w") as f:
+            for seg_file in valid_segments:
+                f.write(f"file '{seg_file}'\n")
+        
+        # Concat without re-encoding first
+        concat_temp = temp_dir / f"concat_temp_{int(time.time())}.mp4"
+        concat_cmd = [
+            "ffmpeg", "-y",
+            "-f", "concat", "-safe", "0",
+            "-i", str(concat_list),
+            "-c", "copy",
+            str(concat_temp)
+        ]
+        
+        result = subprocess.run(concat_cmd, capture_output=True, text=True, timeout=300)
+        
+        if result.returncode != 0:
+            logger.warning(f"Concat failed, trying with re-encode: {result.stderr[:300]}")
+            # Try with re-encode
+            encoder, enc_flags = resolve_encoder(hw_accel)
+            concat_cmd = [
+                "ffmpeg", "-y",
+                "-f", "concat", "-safe", "0",
+                "-i", str(concat_list),
+                "-c:v", encoder
+            ]
+            concat_cmd.extend(enc_flags)
+            concat_cmd.extend(["-c:a", "aac", "-b:a", "128k", str(concat_temp)])
+            result = subprocess.run(concat_cmd, capture_output=True, text=True, timeout=600)
+        
+        # Now apply title, subtitles, watermark on the concatenated video
+        if os.path.exists(concat_temp):
+            # Final pass with overlays
+            final_cmd = ["ffmpeg", "-y", "-i", str(concat_temp)]
+            filters = []
+            extra_inputs = []
+            input_idx = 1
+            out_map = "[0:v]"
+            
+            # Add subtitles if provided
+            if ass_subtitles_path and os.path.exists(ass_subtitles_path):
+                raw_ass = str(Path(ass_subtitles_path).resolve()).replace("\\", "/")
+                escaped_ass = raw_ass.replace(":", "\\:").replace("'", "'\\''")
+                if FONTS_DIR.exists():
+                    raw_fonts = str(FONTS_DIR.resolve()).replace("\\", "/")
+                    escaped_fonts = raw_fonts.replace("'", "'\\''").replace(":", "\\:")
+                    filters.append(f"[0:v]subtitles=filename='{escaped_ass}':fontsdir='{escaped_fonts}'[v_sub]")
+                else:
+                    filters.append(f"[0:v]subtitles=filename='{escaped_ass}'[v_sub]")
+                out_map = "[v_sub]"
+            
+            # Add title overlay if provided
+            if title_overlay_path and os.path.exists(title_overlay_path):
+                extra_inputs.extend(["-i", title_overlay_path])
+                dur = total_duration
+                if title_duration == "5s":
+                    enable_expr = f":enable='between(t,0,5)'"
+                elif title_duration == "10s":
+                    enable_expr = f":enable='between(t,0,10)'"
+                else:
+                    enable_expr = ""
+                
+                if filters:
+                    filters.append(f"{out_map}[{input_idx}:v]overlay=0:0{enable_expr}[v_title]")
+                else:
+                    filters.append(f"[0:v][{input_idx}:v]overlay=0:0{enable_expr}[v_title]")
+                out_map = "[v_title]"
+                input_idx += 1
+            
+            # Build final command
+            final_cmd.extend(extra_inputs)
+            
+            if filters:
+                final_cmd.extend(["-filter_complex", ";".join(filters)])
+                final_cmd.extend(["-map", out_map, "-map", "0:a?"])
+            else:
+                final_cmd.extend(["-map", "0:v", "-map", "0:a?"])
+            
+            encoder, enc_flags = resolve_encoder(hw_accel)
+            final_cmd.extend(["-c:v", encoder])
+            final_cmd.extend(enc_flags)
+            final_cmd.extend(["-c:a", "aac", "-b:a", "128k"])
+            final_cmd.extend(["-movflags", "+faststart"])
+            final_cmd.append(output_path)
+            
+            logger.info("Applying final overlays...")
+            result = subprocess.run(final_cmd, capture_output=True, text=True, timeout=600)
+            
+            if result.returncode != 0:
+                logger.warning(f"Final overlay failed: {result.stderr[:500]}")
+                # Just copy concat result as final
+                import shutil
+                shutil.copy(str(concat_temp), output_path)
+        
+        # Cleanup temp files
+        for seg_file in segment_files:
+            try:
+                if os.path.exists(seg_file):
+                    os.remove(seg_file)
+            except:
+                pass
+        
+        try:
+            os.remove(str(concat_list))
+            os.remove(str(concat_temp))
+        except:
+            pass
+        
+        logger.info(f"HYBRID RENDER complete: {output_path}")
+        return output_path
+        
+    except Exception as e:
+        logger.error(f"Hybrid render error: {e}")
+        # Cleanup on error
+        for seg_file in segment_files:
+            try:
+                if os.path.exists(seg_file):
+                    os.remove(seg_file)
+            except:
+                pass
+        raise
+
+
 def render_clip_to_mp4(
     video_path: str,
     output_mp4_path: str,
@@ -3189,14 +3876,78 @@ def render_clip_to_mp4(
     default_cx = 0.85 if is_streamer else 0.50
     default_cy = 0.78 if is_streamer else 0.35
     face_box = {"found": False, "cx": default_cx, "cy": default_cy, "w": 0.22, "h": 0.25}
+    face_keyframes = None
+    
     if crop_x_percent is not None:
         face_box = {"found": True, "cx": max(0.05, min(0.95, float(crop_x_percent) / 100.0)), "cy": default_cy, "w": 0.22, "h": 0.25}
     elif enable_face_tracking or is_streamer:
-        face_box = detect_speaker_face_box(
+        # Use progressive face tracking for dynamic crop positions
+        face_keyframes = detect_progressive_face_tracking(
             video_path,
+            segment_duration=2.0,  # Analyze every 2 seconds
             facecam_position=facecam_position,
             streamer_preset=streamer_preset
         )
+        # Also get single face_box for compatibility (use first keyframe)
+        if face_keyframes:
+            first_kf = face_keyframes[0]
+            # Check if this is a HYBRID layout (mixed split/track segments)
+            if first_kf.get("type") == "hybrid":
+                logger.info("HYBRID MODE detected - rendering segments separately then concatenating")
+                return render_hybrid_clip(
+                    video_path=video_path,
+                    output_path=output_mp4_path,
+                    segments=first_kf.get("segments", []),
+                    total_duration=first_kf.get("total_duration", clip_duration),
+                    aspect_ratio=aspect_ratio,
+                    background_style=background_style,
+                    streamer_preset=streamer_preset,
+                    title_text=title_text,
+                    title_position=title_position,
+                    title_overlay_path=title_overlay_path,
+                    title_duration=title_duration,
+                    title_y_percent=title_y_percent,
+                    ass_subtitles_path=ass_subtitles_path,
+                    watermark_enabled=watermark_enabled,
+                    watermark_type=watermark_type,
+                    watermark_text=watermark_text,
+                    watermark_image_path=watermark_image_path,
+                    watermark_size=watermark_size,
+                    watermark_opacity=watermark_opacity,
+                    watermark_x_percent=watermark_x_percent,
+                    watermark_y_percent=watermark_y_percent,
+                    hw_accel=hardware_accel,
+                    bgm_path=bgm_path,
+                    bgm_volume=bgm_volume
+                )
+            # Check if this is a podcast split layout
+            elif first_kf.get("type") == "podcast_split":
+                face_box = {
+                    "found": True,
+                    "type": "podcast_split",
+                    "cx": first_kf.get("cx", 0.5),
+                    "cy": first_kf.get("cy", default_cy),
+                    "left_cx": first_kf.get("left_cx", 0.15),
+                    "right_cx": first_kf.get("right_cx", 0.85),
+                    "w": 0.22,
+                    "h": 0.25
+                }
+                # Clear keyframes for podcast split (we use static split instead)
+                face_keyframes = None
+            else:
+                face_box = {
+                    "found": True,
+                    "cx": first_kf.get("cx", default_cx),
+                    "cy": first_kf.get("cy", default_cy),
+                    "w": 0.22,
+                    "h": 0.25
+                }
+        else:
+            face_box = detect_speaker_face_box(
+                video_path,
+                facecam_position=facecam_position,
+                streamer_preset=streamer_preset
+            )
 
     filter_complex, out_video_map = build_ffmpeg_filtergraph(
         aspect_ratio=aspect_ratio,
@@ -3208,7 +3959,8 @@ def render_clip_to_mp4(
         ass_subtitles_path=ass_subtitles_path,
         face_box=face_box,
         title_y_percent=title_y_percent,
-        crop_x_percent=crop_x_percent
+        crop_x_percent=crop_x_percent,
+        face_keyframes=face_keyframes
     )
 
     filter_chains = [filter_complex]

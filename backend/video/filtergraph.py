@@ -1,8 +1,70 @@
+import logging
 import os
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from backend.video_engine import FONTS_DIR, get_ffmpeg_safe_font_path
+
+logger = logging.getLogger("cheat-clip-pro.filtergraph")
+
+
+def _build_dynamic_crop_expr(keyframes: List[Dict[str, Any]], default_cx: float = 0.5) -> str:
+    """
+    Build FFmpeg expression for dynamic crop position based on keyframes.
+    Uses linear interpolation between keyframes for smooth transitions.
+    
+    keyframes: [{"t": 0.0, "cx": 0.5}, {"t": 5.0, "cx": 0.3}, ...]
+    Returns expression like: if(lt(t,5),0.5+(0.3-0.5)*(t-0)/5,if(lt(t,10),...))
+    """
+    if not keyframes or len(keyframes) == 0:
+        return str(default_cx)
+    
+    if len(keyframes) == 1:
+        return f"{keyframes[0]['cx']:.3f}"
+    
+    # Sort by time
+    kfs = sorted(keyframes, key=lambda k: k["t"])
+    
+    # Build nested if expression with linear interpolation
+    # For smooth transitions, interpolate between keyframes
+    expr_parts = []
+    
+    for i in range(len(kfs) - 1):
+        t_start = kfs[i]["t"]
+        t_end = kfs[i + 1]["t"]
+        cx_start = kfs[i]["cx"]
+        cx_end = kfs[i + 1]["cx"]
+        
+        duration = t_end - t_start
+        if duration <= 0:
+            continue
+        
+        # Linear interpolation: cx_start + (cx_end - cx_start) * (t - t_start) / duration
+        # But add smooth transition zone (0.5s ease)
+        ease_duration = min(0.5, duration / 2)
+        
+        if abs(cx_end - cx_start) < 0.05:
+            # No significant change, just use start value
+            interp = f"{cx_start:.3f}"
+        else:
+            # Smooth step using smoothstep-like formula
+            # progress = clamp((t - t_start) / duration, 0, 1)
+            # smoothstep = progress * progress * (3 - 2 * progress)
+            interp = f"({cx_start:.3f}+({cx_end:.3f}-{cx_start:.3f})*clip((t-{t_start:.2f})/{duration:.2f},0,1))"
+        
+        if i == 0:
+            expr_parts.append(f"if(lt(t,{t_end:.2f}),{interp},")
+        else:
+            expr_parts.append(f"if(lt(t,{t_end:.2f}),{interp},")
+    
+    # Last segment continues with last value
+    last_cx = kfs[-1]["cx"]
+    expr_parts.append(f"{last_cx:.3f}")
+    
+    # Close all if statements
+    expr_parts.append(")" * (len(kfs) - 1))
+    
+    return "".join(expr_parts)
 
 
 def build_ffmpeg_filtergraph(
@@ -15,11 +77,14 @@ def build_ffmpeg_filtergraph(
     ass_subtitles_path: Optional[str] = None,
     face_box: Optional[Dict[str, Any]] = None,
     title_y_percent: Optional[float] = None,
-    crop_x_percent: Optional[float] = None
+    crop_x_percent: Optional[float] = None,
+    face_keyframes: Optional[List[Dict[str, Any]]] = None
 ) -> Tuple[str, str]:
     """
     Constructs the FFmpeg -filter_complex chain with proper aspect ratio center-cropping.
     Canvas is always 1080x1920 (9:16).
+    
+    If face_keyframes is provided, uses dynamic crop that changes over time.
     """
     filters = []
     aspect_ratio = (aspect_ratio or "9:16").strip().lower()
@@ -28,6 +93,9 @@ def build_ffmpeg_filtergraph(
 
     face_cx = float(face_box.get("cx", face_center_ratio)) if face_box else face_center_ratio
     face_cy = float(face_box.get("cy", 0.78 if streamer_preset in ["split_top_cam", "pip_corner"] else 0.35)) if face_box else 0.35
+    
+    # Check if we have dynamic keyframes
+    use_dynamic_crop = face_keyframes and len(face_keyframes) > 1
 
     # 1. Base Layout & Scaling
     if streamer_preset == "split_top_cam":
@@ -191,37 +259,93 @@ def build_ffmpeg_filtergraph(
                 )
 
         else:  # 9:16
+            pip_x, pip_y = 736, 120
             if crop_x_percent is not None:
                 crop_ratio_safe = max(0.0, min(1.0, float(crop_x_percent) / 100.0))
+                filters.append(
+                    f"[v_pts]split=2[main_raw][pip_raw];"
+                    f"[main_raw]crop=ih*9/16:ih:(iw-ih*9/16)*{crop_ratio_safe:.3f}:0,scale=1080:1920[main_base];"
+                    f"{pip_crop}"
+                    f"[main_base][pip_box]overlay=x={pip_x}:y={pip_y}[layout_base]"
+                )
             else:
+                # Smart face centering: center the crop window on face_cx
                 safe_cx = float(face_cx)
                 if 0.46 <= safe_cx <= 0.54:
                     safe_cx = 0.50
-                safe_cx = max(0.22, min(0.78, safe_cx))
-                crop_ratio_safe = max(0.0, min(1.0, (safe_cx - 0.158) / 0.684))
-            pip_x, pip_y = 736, 120
-            filters.append(
-                f"[v_pts]split=2[main_raw][pip_raw];"
-                f"[main_raw]crop=ih*9/16:ih:(iw-ih*9/16)*{crop_ratio_safe:.3f}:0,scale=1080:1920[main_base];"
-                f"{pip_crop}"
-                f"[main_base][pip_box]overlay=x={pip_x}:y={pip_y}[layout_base]"
-            )
+                safe_cx = max(0.15, min(0.85, safe_cx))
+                filters.append(
+                    f"[v_pts]split=2[main_raw][pip_raw];"
+                    f"[main_raw]crop=ih*9/16:ih:'max(0,min(iw-ih*9/16,iw*{safe_cx:.3f}-ih*9/32))':0,scale=1080:1920[main_base];"
+                    f"{pip_crop}"
+                    f"[main_base][pip_box]overlay=x={pip_x}:y={pip_y}[layout_base]"
+                )
 
         current_v = "[layout_base]"
 
     elif aspect_ratio == "9:16":
-        # Full Bleed 9:16 with Face Tracking / Manual horizontal crop offset
-        if crop_x_percent is not None:
+        # Check if this is a podcast layout (needs split screen)
+        is_podcast_split = face_box and face_box.get("type") == "podcast_split"
+        
+        if is_podcast_split:
+            # PODCAST SPLIT SCREEN: Two speakers side by side
+            # Crop left speaker at 15%, right speaker at 85%
+            # Stack them vertically (top-bottom) for 9:16 output
+            left_cx = face_box.get("left_cx", 0.15)
+            right_cx = face_box.get("right_cx", 0.85)
+            
+            logger.info(f"9:16 PODCAST SPLIT: left_cx={left_cx:.2f}, right_cx={right_cx:.2f}")
+            
+            # Each half gets 960 pixels height in the final output (total 1920)
+            # Strategy: 
+            # 1. Crop each speaker to 9:16 aspect ratio (width=ih*9/16, height=ih) centered on their position
+            # 2. Scale to 1080x1920 (full 9:16 frame)
+            # 3. Crop vertically with offset y=680 (lower) to focus on face/body area
+            # 4. Stack: LEFT speaker on TOP, RIGHT speaker on BOTTOM
+            filters.append(
+                f"[v_pts]split=2[left_raw][right_raw];"
+                f"[left_raw]crop=ih*9/16:ih:'max(0,min(iw-ih*9/16,iw*{left_cx:.3f}-ih*9/32))':0,scale=1080:1920,crop=1080:960:0:680[left_speaker];"
+                f"[right_raw]crop=ih*9/16:ih:'max(0,min(iw-ih*9/16,iw*{right_cx:.3f}-ih*9/32))':0,scale=1080:1920,crop=1080:960:0:680[right_speaker];"
+                f"[left_speaker][right_speaker]vstack=inputs=2[layout_base]"
+            )
+        elif crop_x_percent is not None:
+            # Manual override: treat as percentage of available horizontal space
             crop_ratio_safe = max(0.0, min(1.0, float(crop_x_percent) / 100.0))
+            logger.info(f"9:16 crop with manual X%: {crop_x_percent}% -> ratio={crop_ratio_safe:.3f}")
+            filters.append(
+                f"[v_pts]crop=ih*9/16:ih:(iw-ih*9/16)*{crop_ratio_safe:.3f}:0,scale=1080:1920[layout_base]"
+            )
+        elif use_dynamic_crop and face_keyframes:
+            # Check if any keyframe indicates podcast layout
+            has_podcast_segments = any(kf.get("type", "").startswith("podcast") for kf in face_keyframes)
+            
+            if has_podcast_segments:
+                # Mixed content: some podcast, some single speaker
+                # For simplicity, use dynamic crop but detect podcast segments
+                # and use split screen for those time ranges
+                # TODO: For now, just use the dynamic expression
+                pass
+            
+            # Progressive/Dynamic face tracking with time-based crop position
+            cx_expr = _build_dynamic_crop_expr(face_keyframes, face_cx)
+            crop_x_expr = f"max(0,min(iw-ih*9/16,iw*({cx_expr})-ih*9/32))"
+            logger.info(f"9:16 DYNAMIC face crop with {len(face_keyframes)} keyframes")
+            for kf in face_keyframes:
+                logger.info(f"  Keyframe t={kf['t']:.1f}s: cx={kf['cx']:.3f}")
+            filters.append(
+                f"[v_pts]crop=w=ih*9/16:h=ih:x='{crop_x_expr}':y=0,scale=1080:1920[layout_base]"
+            )
         else:
+            # Smart face centering: center the crop window on face_cx
             safe_cx = float(face_cx)
+            original_cx = safe_cx
             if 0.46 <= safe_cx <= 0.54:
                 safe_cx = 0.50
-            safe_cx = max(0.22, min(0.78, safe_cx))
-            crop_ratio_safe = max(0.0, min(1.0, (safe_cx - 0.158) / 0.684))
-        filters.append(
-            f"[v_pts]crop=ih*9/16:ih:(iw-ih*9/16)*{crop_ratio_safe:.3f}:0,scale=1080:1920[layout_base]"
-        )
+            safe_cx = max(0.15, min(0.85, safe_cx))
+            logger.info(f"9:16 smart face crop: face_cx={original_cx:.3f} -> safe_cx={safe_cx:.3f}")
+            filters.append(
+                f"[v_pts]crop=ih*9/16:ih:'max(0,min(iw-ih*9/16,iw*{safe_cx:.3f}-ih*9/32))':0,scale=1080:1920[layout_base]"
+            )
         current_v = "[layout_base]"
 
     elif aspect_ratio == "1:1":
