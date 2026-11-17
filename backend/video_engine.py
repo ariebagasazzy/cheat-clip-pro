@@ -2912,19 +2912,65 @@ def detect_progressive_face_tracking(
             # All tracking or mostly tracking - use face tracking with keyframes
             logger.info(f"FACE TRACKING MODE: {len(keyframes)} keyframes")
             
-            # Smooth keyframes for face tracking
+            # Advanced smoothing for face tracking
+            # 1. First pass: apply exponential moving average to reduce jitter
+            alpha = 0.4  # Smoothing factor (lower = smoother but slower response)
+            smoothed_cx = keyframes[0].get("cx", default_cx)
+            for kf in keyframes:
+                if kf.get("layout") != "split":
+                    smoothed_cx = alpha * kf["cx"] + (1 - alpha) * smoothed_cx
+                    kf["cx_smooth"] = smoothed_cx
+            
+            # 2. Second pass: select keyframes with significant movement
+            # Use smaller threshold (0.06 = 6%) for more responsive but smooth tracking
             smoothed = [keyframes[0]]
+            smoothed[0]["cx"] = smoothed[0].get("cx_smooth", smoothed[0]["cx"])
+            
             for kf in keyframes[1:]:
                 if kf.get("layout") == "split":
                     continue
-                if abs(kf["cx"] - smoothed[-1]["cx"]) > 0.12 and kf.get("conf", 0) >= 0.6:
-                    smoothed.append(kf)
+                
+                cx_current = kf.get("cx_smooth", kf["cx"])
+                cx_last = smoothed[-1]["cx"]
+                conf = kf.get("conf", 0.5)
+                
+                # More lenient threshold for high confidence detections
+                threshold = 0.05 if conf >= 0.7 else 0.08
+                
+                if abs(cx_current - cx_last) > threshold:
+                    kf_copy = kf.copy()
+                    kf_copy["cx"] = cx_current
+                    smoothed.append(kf_copy)
+            
+            # 3. If too few keyframes, add intermediate ones for smoother motion
+            if len(smoothed) >= 2:
+                final_keyframes = [smoothed[0]]
+                for i in range(1, len(smoothed)):
+                    prev_kf = smoothed[i-1]
+                    curr_kf = smoothed[i]
+                    
+                    time_gap = curr_kf["t"] - prev_kf["t"]
+                    cx_gap = abs(curr_kf["cx"] - prev_kf["cx"])
+                    
+                    # If large time gap with significant movement, add intermediate keyframe
+                    if time_gap > 3.0 and cx_gap > 0.1:
+                        mid_t = (prev_kf["t"] + curr_kf["t"]) / 2
+                        mid_cx = (prev_kf["cx"] + curr_kf["cx"]) / 2
+                        final_keyframes.append({
+                            "t": mid_t,
+                            "cx": mid_cx,
+                            "cy": curr_kf.get("cy", 0.4),
+                            "conf": (prev_kf.get("conf", 0.5) + curr_kf.get("conf", 0.5)) / 2
+                        })
+                    
+                    final_keyframes.append(curr_kf)
+                smoothed = final_keyframes
             
             if not smoothed:
                 return [{"t": 0.0, "cx": default_cx, "cy": default_cy, "type": "single"}]
             
-            logger.info(f"Progressive tracking: {len(smoothed)} keyframes")
-            for kf in smoothed:
+            logger.info(f"Progressive tracking: {len(smoothed)} smoothed keyframes")
+            for kf in smoothed[:10]:  # Log first 10
                 logger.info(f"  t={kf['t']:.1f}s: cx={kf['cx']:.3f}")
             
             return smoothed

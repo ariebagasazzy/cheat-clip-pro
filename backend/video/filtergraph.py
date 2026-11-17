@@ -284,29 +284,30 @@ def build_ffmpeg_filtergraph(
         current_v = "[layout_base]"
 
     elif aspect_ratio == "9:16":
-        # Check if this is a podcast layout (needs split screen)
+        # Check if this is a podcast layout (needs special handling for no face detected)
         is_podcast_split = face_box and face_box.get("type") == "podcast_split"
         
         if is_podcast_split:
-            # PODCAST SPLIT SCREEN: Two speakers side by side
-            # Crop left speaker at 15%, right speaker at 85%
-            # Stack them vertically (top-bottom) for 9:16 output
-            left_cx = face_box.get("left_cx", 0.15)
-            right_cx = face_box.get("right_cx", 0.85)
+            # NO FACE DETECTED / PODCAST MODE:
+            # Instead of split screen, show full video with blurred background
+            # Background: 9:16 crop from center, blurred
+            # Foreground: Full video letterbox 16:9, scaled to fit width (1080), 
+            #             with padding top/bottom (centered vertically)
             
-            logger.info(f"9:16 PODCAST SPLIT: left_cx={left_cx:.2f}, right_cx={right_cx:.2f}")
+            logger.info(f"9:16 NO FACE MODE: Full video with blurred background letterbox")
             
-            # Each half gets 960 pixels height in the final output (total 1920)
-            # Strategy: 
-            # 1. Crop each speaker to 9:16 aspect ratio (width=ih*9/16, height=ih) centered on their position
-            # 2. Scale to 1080x1920 (full 9:16 frame)
-            # 3. Crop vertically with offset y=680 (lower) to focus on face/body area
-            # 4. Stack: LEFT speaker on TOP, RIGHT speaker on BOTTOM
+            # Calculate 16:9 video height when width is 1080: 1080 * 9/16 = 607.5 ~ 608
+            # Vertical padding: (1920 - 608) / 2 = 656 top/bottom
+            # But we want it centered, so overlay at y = (1920 - 608) / 2 = 656
+            
             filters.append(
-                f"[v_pts]split=2[left_raw][right_raw];"
-                f"[left_raw]crop=ih*9/16:ih:'max(0,min(iw-ih*9/16,iw*{left_cx:.3f}-ih*9/32))':0,scale=1080:1920,crop=1080:960:0:680[left_speaker];"
-                f"[right_raw]crop=ih*9/16:ih:'max(0,min(iw-ih*9/16,iw*{right_cx:.3f}-ih*9/32))':0,scale=1080:1920,crop=1080:960:0:680[right_speaker];"
-                f"[left_speaker][right_speaker]vstack=inputs=2[layout_base]"
+                f"[v_pts]split=2[bg_raw][fg_raw];"
+                # Background: crop 9:16 from center, blur heavily
+                f"[bg_raw]crop=ih*9/16:ih:(iw-ih*9/16)/2:0,scale=1080:1920,boxblur=25:5,eq=brightness=-0.05:saturation=0.8[bg_blurred];"
+                # Foreground: scale full video to fit 1080 width (letterbox 16:9)
+                f"[fg_raw]scale=1080:-2:force_original_aspect_ratio=decrease,pad=1080:608:(ow-iw)/2:(oh-ih)/2:black[fg_letterbox];"
+                # Overlay letterbox on blurred background, centered vertically
+                f"[bg_blurred][fg_letterbox]overlay=0:(1920-608)/2[layout_base]"
             )
         elif crop_x_percent is not None:
             # Manual override: treat as percentage of available horizontal space
