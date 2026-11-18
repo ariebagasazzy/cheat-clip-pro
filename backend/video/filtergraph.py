@@ -264,7 +264,7 @@ def build_ffmpeg_filtergraph(
                 crop_ratio_safe = max(0.0, min(1.0, float(crop_x_percent) / 100.0))
                 filters.append(
                     f"[v_pts]split=2[main_raw][pip_raw];"
-                    f"[main_raw]crop=ih*9/16:ih:(iw-ih*9/16)*{crop_ratio_safe:.3f}:0,scale=1080:1920[main_base];"
+                    f"[main_raw]crop=ih*9/16:ih:(iw-ih*9/16)*{crop_ratio_safe:.3f}:0,scale=1080:1920:flags=lanczos[main_base];"
                     f"{pip_crop}"
                     f"[main_base][pip_box]overlay=x={pip_x}:y={pip_y}[layout_base]"
                 )
@@ -276,7 +276,7 @@ def build_ffmpeg_filtergraph(
                 safe_cx = max(0.15, min(0.85, safe_cx))
                 filters.append(
                     f"[v_pts]split=2[main_raw][pip_raw];"
-                    f"[main_raw]crop=ih*9/16:ih:'max(0,min(iw-ih*9/16,iw*{safe_cx:.3f}-ih*9/32))':0,scale=1080:1920[main_base];"
+                    f"[main_raw]crop=ih*9/16:ih:'max(0,min(iw-ih*9/16,iw*{safe_cx:.3f}-ih*9/32))':0,scale=1080:1920:flags=lanczos[main_base];"
                     f"{pip_crop}"
                     f"[main_base][pip_box]overlay=x={pip_x}:y={pip_y}[layout_base]"
                 )
@@ -317,7 +317,7 @@ def build_ffmpeg_filtergraph(
             crop_ratio_safe = max(0.0, min(1.0, float(crop_x_percent) / 100.0))
             logger.info(f"9:16 crop with manual X%: {crop_x_percent}% -> ratio={crop_ratio_safe:.3f}")
             filters.append(
-                f"[v_pts]crop=ih*9/16:ih:(iw-ih*9/16)*{crop_ratio_safe:.3f}:0,scale=1080:1920[layout_base]"
+                f"[v_pts]crop=ih*9/16:ih:(iw-ih*9/16)*{crop_ratio_safe:.3f}:0,scale=1080:1920:flags=lanczos[layout_base]"
             )
         elif use_dynamic_crop and face_keyframes:
             # Check if any keyframe indicates podcast layout
@@ -337,7 +337,7 @@ def build_ffmpeg_filtergraph(
             for kf in face_keyframes:
                 logger.info(f"  Keyframe t={kf['t']:.1f}s: cx={kf['cx']:.3f}")
             filters.append(
-                f"[v_pts]crop=w=ih*9/16:h=ih:x='{crop_x_expr}':y=0,scale=1080:1920[layout_base]"
+                f"[v_pts]crop=w=ih*9/16:h=ih:x='{crop_x_expr}':y=0,scale=1080:1920:flags=lanczos[layout_base]"
             )
         else:
             # Smart face centering: center the crop window on face_cx
@@ -348,7 +348,7 @@ def build_ffmpeg_filtergraph(
             safe_cx = max(0.15, min(0.85, safe_cx))
             logger.info(f"9:16 smart face crop: face_cx={original_cx:.3f} -> safe_cx={safe_cx:.3f}")
             filters.append(
-                f"[v_pts]crop=ih*9/16:ih:'max(0,min(iw-ih*9/16,iw*{safe_cx:.3f}-ih*9/32))':0,scale=1080:1920[layout_base]"
+                f"[v_pts]crop=ih*9/16:ih:'max(0,min(iw-ih*9/16,iw*{safe_cx:.3f}-ih*9/32))':0,scale=1080:1920:flags=lanczos[layout_base]"
             )
         current_v = "[layout_base]"
 
