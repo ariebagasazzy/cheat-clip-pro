@@ -284,30 +284,33 @@ def build_ffmpeg_filtergraph(
         current_v = "[layout_base]"
 
     elif aspect_ratio == "9:16":
-        # Check if this is a podcast layout (needs special handling for no face detected)
-        is_podcast_split = face_box and face_box.get("type") == "podcast_split"
+        # Check if this is a podcast/split layout (0 or 2+ faces detected)
+        is_podcast_split = face_box and face_box.get("type") in ["podcast_split", "split"]
         
         if is_podcast_split:
-            # NO FACE DETECTED / PODCAST MODE:
-            # Instead of split screen, show full video with blurred background
-            # Background: 9:16 crop from center, blurred
-            # Foreground: Full video letterbox 16:9, scaled to fit width (1080), 
-            #             with padding top/bottom (centered vertically)
+            # SPLIT MODE: 0 or 2+ faces detected
+            # Split video left-right, stack vertically, add blur padding
+            # 
+            # For 16:9 source (1920x1080):
+            #   - Split into left half (960x1080, ratio 8:9) and right half (960x1080, ratio 8:9)
+            #   - Stack vertically: 960x2160 (ratio 8:18 = 4:9)
+            #   - Scale to height 1920: width = 1920 * 4/9 = 853.3
+            #   - Add blur padding left-right: (1080 - 853) / 2 = 113.5 each side
             
-            logger.info(f"9:16 NO FACE MODE: Full video with blurred background letterbox")
-            
-            # Calculate 16:9 video height when width is 1080: 1080 * 9/16 = 607.5 ~ 608
-            # Vertical padding: (1920 - 608) / 2 = 656 top/bottom
-            # But we want it centered, so overlay at y = (1920 - 608) / 2 = 656
+            logger.info(f"9:16 SPLIT MODE: Left-right split with blur padding")
             
             filters.append(
-                f"[v_pts]split=2[bg_raw][fg_raw];"
-                # Background: crop 9:16 from center, blur heavily
-                f"[bg_raw]crop=ih*9/16:ih:(iw-ih*9/16)/2:0,scale=1080:1920,boxblur=25:5,eq=brightness=-0.05:saturation=0.8[bg_blurred];"
-                # Foreground: scale full video to fit 1080 width (letterbox 16:9)
-                f"[fg_raw]scale=1080:-2:force_original_aspect_ratio=decrease,pad=1080:608:(ow-iw)/2:(oh-ih)/2:black[fg_letterbox];"
-                # Overlay letterbox on blurred background, centered vertically
-                f"[bg_blurred][fg_letterbox]overlay=0:(1920-608)/2[layout_base]"
+                f"[v_pts]split=3[left_raw][right_raw][bg_src];"
+                # Left half: crop left 50% of frame, scale to 853x960
+                f"[left_raw]crop=iw/2:ih:0:0,scale=853:960:flags=lanczos[left_half];"
+                # Right half: crop right 50% of frame, scale to 853x960
+                f"[right_raw]crop=iw/2:ih:iw/2:0,scale=853:960:flags=lanczos[right_half];"
+                # Stack vertically (853x1920)
+                f"[left_half][right_half]vstack=inputs=2[stacked];"
+                # Create blur background from center of original (1080x1920)
+                f"[bg_src]crop=ih*9/16:ih:(iw-ih*9/16)/2:0,scale=1080:1920:flags=bilinear,boxblur=20:3,eq=brightness=-0.03:saturation=0.8[bg_blur];"
+                # Overlay stacked video on blur background (centered horizontally)
+                f"[bg_blur][stacked]overlay=(1080-853)/2:0[layout_base]"
             )
         elif crop_x_percent is not None:
             # Manual override: treat as percentage of available horizontal space
