@@ -4192,7 +4192,7 @@ def render_clip_to_mp4(
                 "-filter_complex", final_filter_complex,
                 "-map", out_video_map,
                 "-map", out_audio_map,
-                "-c:v", "libx264", "-preset", "veryfast", "-crf", "22", "-threads", "2",
+                "-c:v", "libx264", "-preset", "medium", "-crf", "18", "-threads", "0",
                 "-c:a", "aac", "-b:a", "192k",
                 "-pix_fmt", "yuv420p",
                 "-movflags", "+faststart",
