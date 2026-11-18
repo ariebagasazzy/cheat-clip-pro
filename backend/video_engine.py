@@ -526,8 +526,9 @@ def get_yt_dlp_base_cmd(
             logger.info(f"Using YouTube cookies from: {eff}")
             cmd.extend(["--cookies", str(eff)])
 
-    # Anti-throttling & bot detection bypass for YouTube player
-    cmd.extend(["--extractor-args", "youtube:player_client=android,ios,web"])
+    # NOTE: Removed youtube:player_client=android,ios,web because android/ios clients 
+    # now require GVS PO Token (as of 2024), causing yt-dlp to skip those formats 
+    # and fallback to 360p (format 18). Default extraction works better.
     cmd.append("--force-ipv4")
     return cmd
 
@@ -1454,6 +1455,8 @@ def transcribe_clip_words(
 
             if words:
                 logger.info(f"Whisper successfully transcribed {len(words)} acoustic words for clip.")
+                if words[:3]:
+                    logger.info(f"[SUBTITLE DEBUG] First 3 words: {words[:3]}")
                 return words
         except Exception as e:
             logger.warning(f"Whisper acoustic transcription error: {e}")
@@ -1509,6 +1512,8 @@ def transcribe_clip_words(
                 cur_s = w_e
         if words:
             logger.info(f"Fallback: using transcript words for clip range [{clip_start_time:.1f}s -> {clip_end_time:.1f}s].")
+            if words[:3]:
+                logger.info(f"[SUBTITLE DEBUG] First 3 fallback words: {words[:3]}")
             return words
 
     return []
