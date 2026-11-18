@@ -982,6 +982,7 @@ def download_clip_segment(
 
     with ephemeral_cookies_file(cookies_content) as temp_cookies:
         has_cookies = temp_cookies is not None or get_effective_cookies_path() is not None
+        logger.info(f"[COOKIES DEBUG] cookies_content length: {len(cookies_content) if cookies_content else 0}, temp_cookies: {temp_cookies}, has_cookies: {has_cookies}")
         # If cookies are present, try with cookies first; if rejected by YouTube (or any reload/bot error), try guest mode.
         attempts = [True, False] if has_cookies else [False]
         last_err_snippet = "unknown"
