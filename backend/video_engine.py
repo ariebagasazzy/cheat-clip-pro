@@ -345,10 +345,10 @@ def check_encoder_support(encoder_name: str) -> bool:
 
 
 ENCODER_CONFIGS: Dict[str, Tuple[str, List[str]]] = {
-    "nvenc": ("h264_nvenc", ["-c:v", "h264_nvenc", "-preset", "p4", "-cq", "23"]),
-    "amf": ("h264_amf", ["-c:v", "h264_amf", "-quality", "speed", "-rc", "cbr", "-b:v", "6M"]),
-    "qsv": ("h264_qsv", ["-c:v", "h264_qsv", "-preset", "veryfast", "-global_quality", "23", "-look_ahead", "0"]),
-    "cpu": ("libx264", ["-c:v", "libx264", "-preset", "veryfast", "-crf", "22", "-threads", "2"]),
+    "nvenc": ("h264_nvenc", ["-c:v", "h264_nvenc", "-preset", "p4", "-cq", "18"]),
+    "amf": ("h264_amf", ["-c:v", "h264_amf", "-quality", "quality", "-rc", "vbr_latency", "-qp_i", "18", "-qp_p", "20"]),
+    "qsv": ("h264_qsv", ["-c:v", "h264_qsv", "-preset", "medium", "-global_quality", "18", "-look_ahead", "1"]),
+    "cpu": ("libx264", ["-c:v", "libx264", "-preset", "medium", "-crf", "18", "-threads", "0"]),
 }
 
 _DETECTED_SUPPORT: Optional[Dict[str, Any]] = None
@@ -3667,7 +3667,7 @@ def render_hybrid_clip(
                 "-filter_complex", filter_complex,
                 "-map", out_video_map, "-map", "0:a?"
             ]
-            cmd.extend(["-c:v", encoder])
+            # enc_flags already contains -c:v and codec, so just extend with enc_flags
             cmd.extend(enc_flags)
             cmd.extend(["-c:a", "aac", "-b:a", "128k"])
             cmd.extend(["-movflags", "+faststart"])
@@ -3779,7 +3779,7 @@ def render_hybrid_clip(
                 final_cmd.extend(["-map", "0:v", "-map", "0:a?"])
             
             encoder, enc_flags = resolve_encoder(hw_accel)
-            final_cmd.extend(["-c:v", encoder])
+            # enc_flags already contains -c:v and codec
             final_cmd.extend(enc_flags)
             final_cmd.extend(["-c:a", "aac", "-b:a", "128k"])
             final_cmd.extend(["-movflags", "+faststart"])
