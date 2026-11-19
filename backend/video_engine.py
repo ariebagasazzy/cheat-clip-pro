@@ -345,10 +345,12 @@ def check_encoder_support(encoder_name: str) -> bool:
 
 
 ENCODER_CONFIGS: Dict[str, Tuple[str, List[str]]] = {
-    "nvenc": ("h264_nvenc", ["-c:v", "h264_nvenc", "-preset", "p4", "-cq", "18"]),
-    "amf": ("h264_amf", ["-c:v", "h264_amf", "-quality", "quality", "-rc", "vbr_latency", "-qp_i", "18", "-qp_p", "20"]),
-    "qsv": ("h264_qsv", ["-c:v", "h264_qsv", "-preset", "medium", "-global_quality", "18", "-look_ahead", "1"]),
-    "cpu": ("libx264", ["-c:v", "libx264", "-preset", "medium", "-crf", "18", "-threads", "0"]),
+    # Quality 23-24 = sweet spot for sharp 1080p with reasonable file size (~8-15 Mbps)
+    # Lower number = higher quality/larger file, Higher number = lower quality/smaller file
+    "nvenc": ("h264_nvenc", ["-c:v", "h264_nvenc", "-preset", "p4", "-cq", "23"]),
+    "amf": ("h264_amf", ["-c:v", "h264_amf", "-quality", "quality", "-rc", "vbr_latency", "-qp_i", "23", "-qp_p", "25"]),
+    "qsv": ("h264_qsv", ["-c:v", "h264_qsv", "-preset", "medium", "-global_quality", "23", "-look_ahead", "1"]),
+    "cpu": ("libx264", ["-c:v", "libx264", "-preset", "medium", "-crf", "23", "-threads", "0"]),
 }
 
 _DETECTED_SUPPORT: Optional[Dict[str, Any]] = None
@@ -2641,9 +2643,9 @@ def detect_progressive_face_tracking(
             "top_right": (0.85, 0.22),
             "bottom_left": (0.15, 0.78),
             "top_left": (0.15, 0.22),
-            "center": (0.50, 0.35),
-            "left": (0.35, 0.35),
-            "right": (0.65, 0.35),
+            "center": (0.50, 0.50),
+            "left": (0.25, 0.50),
+            "right": (0.75, 0.50),
         }
         if pos in static_positions:
             cx, cy = static_positions[pos]
@@ -3017,11 +3019,11 @@ def detect_speaker_face_box(
     elif pos == "top_left":
         return {"found": True, "cx": 0.15, "cy": 0.22, "w": 0.22, "h": 0.25}
     elif pos == "center":
-        return {"found": True, "cx": 0.50, "cy": 0.35, "w": 0.25, "h": 0.25}
+        return {"found": True, "cx": 0.50, "cy": 0.50, "w": 0.25, "h": 0.25}
     elif pos == "left":
-        return {"found": True, "cx": 0.35, "cy": 0.35, "w": 0.25, "h": 0.25}
+        return {"found": True, "cx": 0.25, "cy": 0.50, "w": 0.25, "h": 0.25}
     elif pos == "right":
-        return {"found": True, "cx": 0.65, "cy": 0.35, "w": 0.25, "h": 0.25}
+        return {"found": True, "cx": 0.75, "cy": 0.50, "w": 0.25, "h": 0.25}
 
     is_streamer = streamer_preset in ["split_top_cam", "pip_corner"]
     default_cx = 0.85 if is_streamer else 0.50
@@ -3899,9 +3901,37 @@ def render_clip_to_mp4(
     face_box = {"found": False, "cx": default_cx, "cy": default_cy, "w": 0.22, "h": 0.25}
     face_keyframes = None
     
-    if crop_x_percent is not None:
+    # For streamer presets (pip_corner, split_top_cam), facecam_position determines where to extract the facecam
+    # This is separate from face tracking which tracks faces within the extracted region
+    pos = (facecam_position or "auto").lower().strip()
+    
+    # Manual facecam position mapping for all corner/position options
+    static_positions = {
+        "bottom_right": (0.85, 0.78),
+        "top_right": (0.85, 0.22),
+        "bottom_left": (0.15, 0.78),
+        "top_left": (0.15, 0.22),
+        "center": (0.50, 0.50),
+        "left": (0.25, 0.50),
+        "right": (0.75, 0.50),
+    }
+    
+    # Determine if we should use manual position or auto-detect
+    use_manual_facecam = is_streamer and pos != "auto" and pos in static_positions
+    
+    if use_manual_facecam:
+        # Manual facecam position specified for streamer layout - this takes priority
+        cx, cy = static_positions[pos]
+        face_box = {"found": True, "cx": cx, "cy": cy, "w": 0.22, "h": 0.25}
+        logger.info(f"[PIP DEBUG] Using manual facecam position: {pos} -> cx={cx}, cy={cy}")
+        # Don't run face tracking for manual position in streamer mode
+        face_keyframes = None
+    elif crop_x_percent is not None and not is_streamer:
+        # Manual horizontal crop for non-streamer modes
         face_box = {"found": True, "cx": max(0.05, min(0.95, float(crop_x_percent) / 100.0)), "cy": default_cy, "w": 0.22, "h": 0.25}
-    elif enable_face_tracking or is_streamer:
+        logger.info(f"[CROP DEBUG] Using manual crop_x_percent: {crop_x_percent}% -> cx={face_box['cx']}")
+    elif enable_face_tracking or (is_streamer and pos == "auto"):
+        logger.info(f"[TRACKING DEBUG] Starting face tracking: facecam_position={facecam_position}, streamer_preset={streamer_preset}, is_streamer={is_streamer}")
         # Use progressive face tracking for dynamic crop positions
         face_keyframes = detect_progressive_face_tracking(
             video_path,
@@ -3909,6 +3939,7 @@ def render_clip_to_mp4(
             facecam_position=facecam_position,
             streamer_preset=streamer_preset
         )
+        logger.info(f"[TRACKING DEBUG] face_keyframes result: {face_keyframes[:3] if face_keyframes else 'None'}")
         # Also get single face_box for compatibility (use first keyframe)
         if face_keyframes:
             first_kf = face_keyframes[0]
@@ -3969,6 +4000,7 @@ def render_clip_to_mp4(
                 facecam_position=facecam_position,
                 streamer_preset=streamer_preset
             )
+            logger.info(f"[PIP DEBUG] facecam_position={facecam_position}, streamer_preset={streamer_preset}, face_box={face_box}")
 
     filter_complex, out_video_map = build_ffmpeg_filtergraph(
         aspect_ratio=aspect_ratio,
